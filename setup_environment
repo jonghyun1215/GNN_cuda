@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+_gnn_cuda_is_sourced() {
+    [[ "${BASH_SOURCE[0]}" != "$0" ]]
+}
+
+_gnn_cuda_script_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
+}
+
+_gnn_cuda_workspace_root() {
+    cd "$(_gnn_cuda_script_dir)/.." && pwd
+}
+
+_gnn_cuda_setup_vars() {
+    local dataset_path="${1:-${GNN_DATASET_ROOT:-/root/workspace/mnt/dataset_npz}}"
+    export WORKSPACE_ROOT="$(_gnn_cuda_workspace_root)"
+    export GNN_CUDA_ROOT="$(_gnn_cuda_script_dir)"
+    export GNN_MODELS_ROOT="${WORKSPACE_ROOT}/GNN_models"
+    export GNN_DATASET_ROOT="${dataset_path}"
+    export GNN_ENV_DIR="${GNN_CUDA_ROOT}/env"
+    export GNN_PYG_ENV_FILE="${GNN_ENV_DIR}/cu128_pyg.yml"
+    export GNN_DGL_ENV_FILE="${GNN_ENV_DIR}/cu128_dgl.yml"
+    export GNN_PYG_ENV="${GNN_PYG_ENV:-cu128_pyg}"
+    export GNN_DGL_ENV="${GNN_DGL_ENV:-cu128_dgl}"
+    export PYTHONPATH="${WORKSPACE_ROOT}:${GNN_MODELS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+}
+
+gnn_cuda_show_environment() {
+    echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}"
+    echo "GNN_CUDA_ROOT=${GNN_CUDA_ROOT}"
+    echo "GNN_MODELS_ROOT=${GNN_MODELS_ROOT}"
+    echo "GNN_DATASET_ROOT=${GNN_DATASET_ROOT}"
+    echo "GNN_ENV_DIR=${GNN_ENV_DIR}"
+    echo "GNN_PYG_ENV=${GNN_PYG_ENV}"
+    echo "GNN_DGL_ENV=${GNN_DGL_ENV}"
+    echo "GNN_PYG_ENV_FILE=${GNN_PYG_ENV_FILE}"
+    echo "GNN_DGL_ENV_FILE=${GNN_DGL_ENV_FILE}"
+    echo "PYTHONPATH=${PYTHONPATH}"
+}
+
+_gnn_cuda_env_exists() {
+    conda env list | awk 'NF && $1 !~ /^#/ {print $1}' | grep -Fxq "$1"
+}
+
+_gnn_cuda_create_env_if_missing() {
+    local env_name="$1"
+    local env_file="$2"
+    if _gnn_cuda_env_exists "${env_name}"; then
+        echo "Conda env '${env_name}' already exists; skipping create."
+        return
+    fi
+    echo "Creating conda env '${env_name}' from ${env_file}"
+    conda env create -f "${env_file}"
+}
+
+_gnn_cuda_build_one_env() {
+    local env_name="$1"
+    echo "Building native extensions in '${env_name}'"
+    conda run --no-capture-output -n "${env_name}" python - <<'PY'
+import os
+import sys
+
+for env_key in ("WORKSPACE_ROOT", "GNN_MODELS_ROOT"):
+    path = os.environ.get(env_key)
+    if path and path not in sys.path:
+        sys.path.insert(0, path)
+
+from GNN_cuda.GNN_cuda_common.loader import (
+    load_agg_module,
+    load_allocator_module,
+    load_gcn_module,
+)
+
+load_allocator_module()
+load_agg_module()
+load_gcn_module()
+print("Native extensions are ready.")
+PY
+}
+
+_gnn_cuda_print_environment() {
+    gnn_cuda_show_environment
+    command -v nvcc >/dev/null 2>&1 && nvcc --version | tail -n 1 || true
+    command -v conda >/dev/null 2>&1 && conda info --envs || true
+}
+
+gnn_cuda_create_envs() {
+    local build_after_create=0
+
+    while (($# > 0)); do
+        case "$1" in
+            --build)
+                build_after_create=1
+                ;;
+            --help|-h)
+                echo "Usage: gnn_cuda_create_envs [--build]"
+                return 0
+                ;;
+            *)
+                echo "Unknown option for gnn_cuda_create_envs: $1" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    _gnn_cuda_create_env_if_missing "${GNN_PYG_ENV}" "${GNN_PYG_ENV_FILE}"
+    _gnn_cuda_create_env_if_missing "${GNN_DGL_ENV}" "${GNN_DGL_ENV_FILE}"
+
+    if (( build_after_create )); then
+        _gnn_cuda_print_environment
+        _gnn_cuda_build_one_env "${GNN_PYG_ENV}"
+        _gnn_cuda_build_one_env "${GNN_DGL_ENV}"
+        echo
+        echo "Environment creation and build complete."
+    fi
+}
+
+gnn_cuda_usage() {
+    cat <<'EOF'
+Usage:
+  source setup_environment [dataset_path]
+  ./setup_environment [dataset_path] [--create-envs] [--build]
+
+Helpers available after sourcing:
+  gnn_cuda_show_environment
+  gnn_cuda_create_envs [--build]
+EOF
+}
+
+_gnn_cuda_print_source_message() {
+    echo "GNN CUDA environment loaded."
+    echo "Dataset root: ${GNN_DATASET_ROOT}"
+    echo "Helpers:"
+    echo "  gnn_cuda_show_environment"
+    echo "  gnn_cuda_create_envs [--build]"
+}
+
+_gnn_cuda_main() {
+    local dataset_path=""
+    local create_envs=0
+    local build_after_create=0
+
+    while (($# > 0)); do
+        case "$1" in
+            --create-envs)
+                create_envs=1
+                ;;
+            --build)
+                build_after_create=1
+                create_envs=1
+                ;;
+            --help|-h)
+                gnn_cuda_usage
+                return 0
+                ;;
+            *)
+                if [[ -z "${dataset_path}" ]]; then
+                    dataset_path="$1"
+                else
+                    echo "Unknown option: $1" >&2
+                    gnn_cuda_usage >&2
+                    return 1
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    _gnn_cuda_setup_vars "${dataset_path}"
+
+    if _gnn_cuda_is_sourced; then
+        _gnn_cuda_print_source_message
+    fi
+
+    if (( create_envs )); then
+        if (( build_after_create )); then
+            gnn_cuda_create_envs --build
+        else
+            gnn_cuda_create_envs
+        fi
+    fi
+}
+
+_gnn_cuda_main "$@"

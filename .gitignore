@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Native/JIT build artifacts
+build/
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+*.ninja_deps
+*.ninja_log
+
+# Local test or copied datasets
+test_datasets/
+datasets/
+data/
+*.npz
+
+# Tooling noise
+.pytest_cache/
+.mypy_cache/
