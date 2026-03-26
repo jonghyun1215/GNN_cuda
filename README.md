@@ -39,7 +39,7 @@ python run/GCN_inference.py --framework pyg --dataset all
 - `--dataset`: dataset name or `all`
 - `--dim`: base feature / hidden / output dimension, default `128`
 - `--num_layers`: number of layers
-- `--graph_memory_mode`: graph-input placement, `device`, `uvm`, or `hmm`
+- `--graph_memory_mode`: graph-input placement, `device`, `uvm`, or `host_mapped`
 - `--compute_memory_mode`: weights / outputs / scratch placement, `device` or `uvm`
 - `--device`: execution device, for example `cuda:0`
 - `--warmup`: number of warmup iterations, default `1`
@@ -49,4 +49,4 @@ Memory modes:
 
 - `device`: regular CUDA device memory
 - `uvm`: `cudaMallocManaged`-based UVM
-- `hmm`: current host-mapped graph-input path
+- `host_mapped`: current host-mapped graph-input path

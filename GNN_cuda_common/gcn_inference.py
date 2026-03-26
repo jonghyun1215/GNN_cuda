@@ -175,7 +175,7 @@ def run_gcn_inference(
     parser.add_argument("--num_layers", type=int, default=2, help="number of GCN layers")
     parser.add_argument("--use_npz_features", action="store_true", help="use sparse features saved in npz if present")
     parser.add_argument("--memory_mode", type=str, default="uvm", help="shared fallback backend for graph/compute allocation: device or uvm; legacy aliases managed/torch_cuda are also accepted")
-    parser.add_argument("--graph_memory_mode", type=str, default=None, help="graph backend for CSR/features inputs: device, uvm, hmm; legacy aliases managed/torch_cuda/host_mapped are also accepted")
+    parser.add_argument("--graph_memory_mode", type=str, default=None, help="graph backend for CSR/features inputs: device, uvm, host_mapped; legacy aliases managed/torch_cuda are also accepted")
     parser.add_argument("--compute_memory_mode", type=str, default=None, help="compute backend for weights/outputs/scratch: device or uvm; legacy aliases managed/torch_cuda are also accepted")
     parser.add_argument("--preferred_location", type=str, default="cuda", choices=["none", "cpu", "cuda"], help="UVM preferred location hint")
     parser.add_argument("--accessed_by_cpu", action="store_true", help="mark UVM tensors as CPU-accessible")
@@ -201,20 +201,20 @@ def run_gcn_inference(
     if args.amp:
         raise ValueError("The CUDA GCN prototype only supports float32 today.")
     nvtx_enabled = bool(args.nvtx and device.type == "cuda")
-    shared_memory_mode = normalize_memory_mode(args.memory_mode, allow_hmm=True)
-    graph_memory_mode = normalize_memory_mode(args.graph_memory_mode or shared_memory_mode, allow_hmm=True)
+    shared_memory_mode = normalize_memory_mode(args.memory_mode, allow_host_mapped=True)
+    graph_memory_mode = normalize_memory_mode(args.graph_memory_mode or shared_memory_mode, allow_host_mapped=True)
     try:
-        compute_memory_mode = normalize_memory_mode(args.compute_memory_mode or shared_memory_mode, allow_hmm=False)
+        compute_memory_mode = normalize_memory_mode(args.compute_memory_mode or shared_memory_mode, allow_host_mapped=False)
     except ValueError as exc:
         raise ValueError(
-            f"compute_memory_mode expects one of {COMPUTE_MEMORY_MODES}; use --graph_memory_mode hmm with --compute_memory_mode uvm/device"
+            f"compute_memory_mode expects one of {COMPUTE_MEMORY_MODES}; use --graph_memory_mode host_mapped with --compute_memory_mode uvm/device"
         ) from exc
     args.memory_mode = shared_memory_mode
     args.graph_memory_mode = graph_memory_mode
     args.compute_memory_mode = compute_memory_mode
     print(args)
-    if graph_memory_mode == "hmm" and device.type != "cuda":
-        raise ValueError(f"graph_memory_mode expects one of {GRAPH_MEMORY_MODES} on CUDA; 'hmm' requires a CUDA device")
+    if graph_memory_mode == "host_mapped" and device.type != "cuda":
+        raise ValueError(f"graph_memory_mode expects one of {GRAPH_MEMORY_MODES} on CUDA; 'host_mapped' requires a CUDA device")
     managed_cfg = ManagedAllocationConfig(
         preferred_location=str(args.preferred_location),
         accessed_by_cpu=bool(args.accessed_by_cpu),

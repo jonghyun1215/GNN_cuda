@@ -22,15 +22,14 @@ LOCATION_TO_CODE = {
     "cuda": 0,
 }
 
-GRAPH_MEMORY_MODES = ("device", "uvm", "hmm")
+GRAPH_MEMORY_MODES = ("device", "uvm", "host_mapped")
 COMPUTE_MEMORY_MODES = ("device", "uvm")
 MEMORY_MODE_ALIASES = {
     "device": "device",
     "torch_cuda": "device",
     "uvm": "uvm",
     "managed": "uvm",
-    "hmm": "hmm",
-    "host_mapped": "hmm",
+    "host_mapped": "host_mapped",
 }
 
 
@@ -47,19 +46,19 @@ def _allocator():
     return load_allocator_module()
 
 
-def normalize_memory_mode(memory_mode: str, *, allow_hmm: bool) -> str:
+def normalize_memory_mode(memory_mode: str, *, allow_host_mapped: bool) -> str:
     try:
         normalized = MEMORY_MODE_ALIASES[str(memory_mode)]
     except KeyError as exc:
-        supported = GRAPH_MEMORY_MODES if allow_hmm else COMPUTE_MEMORY_MODES
+        supported = GRAPH_MEMORY_MODES if allow_host_mapped else COMPUTE_MEMORY_MODES
         raise ValueError(f"Unsupported memory_mode: {memory_mode}. Expected one of {supported}.") from exc
-    if normalized == "hmm" and not allow_hmm:
-        raise ValueError("compute memory only supports 'device' or 'uvm'; 'hmm' is graph-only")
+    if normalized == "host_mapped" and not allow_host_mapped:
+        raise ValueError("compute memory only supports 'device' or 'uvm'; 'host_mapped' is graph-only")
     return normalized
 
 
 def is_uvm_mode(memory_mode: str) -> bool:
-    return normalize_memory_mode(memory_mode, allow_hmm=True) == "uvm"
+    return normalize_memory_mode(memory_mode, allow_host_mapped=True) == "uvm"
 
 
 def managed_empty(
@@ -98,12 +97,12 @@ def allocate_like_mode(
     memory_mode: str,
     device: torch.device,
 ) -> torch.Tensor:
-    memory_mode = normalize_memory_mode(memory_mode, allow_hmm=True)
+    memory_mode = normalize_memory_mode(memory_mode, allow_host_mapped=True)
     if memory_mode == "uvm":
         out = managed_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
         out.copy_(cpu_tensor, non_blocking=False)
         return out
-    if memory_mode == "hmm":
+    if memory_mode == "host_mapped":
         out = host_mapped_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
         out.copy_(cpu_tensor, non_blocking=False)
         return out
@@ -119,10 +118,10 @@ def allocate_empty(
     device: torch.device,
     memory_mode: str,
 ) -> torch.Tensor:
-    memory_mode = normalize_memory_mode(memory_mode, allow_hmm=True)
+    memory_mode = normalize_memory_mode(memory_mode, allow_host_mapped=True)
     if memory_mode == "uvm":
         return managed_empty(shape, dtype=dtype, device=device)
-    if memory_mode == "hmm":
+    if memory_mode == "host_mapped":
         return host_mapped_empty(shape, dtype=dtype, device=device)
     if memory_mode == "device":
         return torch.empty(tuple(shape), dtype=dtype, device=device)
