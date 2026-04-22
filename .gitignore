@@ -17,7 +17,7 @@ test_datasets/
 datasets/
 data/
 *.npz
-
+report/*
 # Tooling noise
 .pytest_cache/
 .mypy_cache/
