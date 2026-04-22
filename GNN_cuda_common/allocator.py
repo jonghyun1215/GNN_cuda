@@ -22,14 +22,15 @@ LOCATION_TO_CODE = {
     "cuda": 0,
 }
 
-GRAPH_MEMORY_MODES = ("device", "uvm", "host_mapped")
+GRAPH_MEMORY_MODES = ("device", "uvm", "hmm")
 COMPUTE_MEMORY_MODES = ("device", "uvm")
+WEIGHT_MEMORY_MODES = COMPUTE_MEMORY_MODES
 MEMORY_MODE_ALIASES = {
     "device": "device",
     "torch_cuda": "device",
     "uvm": "uvm",
     "managed": "uvm",
-    "host_mapped": "host_mapped",
+    "hmm": "hmm",
 }
 
 
@@ -46,19 +47,31 @@ def _allocator():
     return load_allocator_module()
 
 
-def normalize_memory_mode(memory_mode: str, *, allow_host_mapped: bool) -> str:
+def normalize_memory_mode(memory_mode: str, *, allow_hmm: bool) -> str:
     try:
         normalized = MEMORY_MODE_ALIASES[str(memory_mode)]
     except KeyError as exc:
-        supported = GRAPH_MEMORY_MODES if allow_host_mapped else COMPUTE_MEMORY_MODES
+        supported = GRAPH_MEMORY_MODES if allow_hmm else COMPUTE_MEMORY_MODES
         raise ValueError(f"Unsupported memory_mode: {memory_mode}. Expected one of {supported}.") from exc
-    if normalized == "host_mapped" and not allow_host_mapped:
-        raise ValueError("compute memory only supports 'device' or 'uvm'; 'host_mapped' is graph-only")
+    if normalized == "hmm" and not allow_hmm:
+        raise ValueError("compute memory only supports 'device' or 'uvm'; 'hmm' is graph-only")
     return normalized
 
 
 def is_uvm_mode(memory_mode: str) -> bool:
-    return normalize_memory_mode(memory_mode, allow_host_mapped=True) == "uvm"
+    return normalize_memory_mode(memory_mode, allow_hmm=True) == "uvm"
+
+
+def is_hmm_mode(memory_mode: str) -> bool:
+    return normalize_memory_mode(memory_mode, allow_hmm=True) == "hmm"
+
+
+def uses_cuda_memory_hints(memory_mode: str) -> bool:
+    return normalize_memory_mode(memory_mode, allow_hmm=True) in ("uvm", "hmm")
+
+
+def prefers_hmm_spmm(*memory_modes: str) -> bool:
+    return any(normalize_memory_mode(memory_mode, allow_hmm=True) == "hmm" for memory_mode in memory_modes)
 
 
 def managed_empty(
@@ -76,19 +89,19 @@ def managed_empty(
     return _allocator().managed_empty(list(shape), dtype_code, int(device.index or 0))
 
 
-def host_mapped_empty(
+def hmm_empty(
     shape: Iterable[int],
     *,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
     if device.type != "cuda":
-        raise ValueError("host_mapped_empty requires a CUDA device for mapping")
+        raise ValueError("hmm_empty requires a CUDA device")
     try:
         dtype_code = DTYPE_TO_CODE[dtype]
     except KeyError as exc:
-        raise ValueError(f"Unsupported dtype for host-mapped allocation: {dtype}") from exc
-    return _allocator().host_mapped_empty(list(shape), dtype_code, int(device.index or 0))
+        raise ValueError(f"Unsupported dtype for hmm allocation: {dtype}") from exc
+    return _allocator().hmm_empty(list(shape), dtype_code, int(device.index or 0))
 
 
 def allocate_like_mode(
@@ -97,13 +110,13 @@ def allocate_like_mode(
     memory_mode: str,
     device: torch.device,
 ) -> torch.Tensor:
-    memory_mode = normalize_memory_mode(memory_mode, allow_host_mapped=True)
+    memory_mode = normalize_memory_mode(memory_mode, allow_hmm=True)
     if memory_mode == "uvm":
         out = managed_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
         out.copy_(cpu_tensor, non_blocking=False)
         return out
-    if memory_mode == "host_mapped":
-        out = host_mapped_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
+    if memory_mode == "hmm":
+        out = hmm_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
         out.copy_(cpu_tensor, non_blocking=False)
         return out
     if memory_mode == "device":
@@ -118,11 +131,11 @@ def allocate_empty(
     device: torch.device,
     memory_mode: str,
 ) -> torch.Tensor:
-    memory_mode = normalize_memory_mode(memory_mode, allow_host_mapped=True)
+    memory_mode = normalize_memory_mode(memory_mode, allow_hmm=True)
     if memory_mode == "uvm":
         return managed_empty(shape, dtype=dtype, device=device)
-    if memory_mode == "host_mapped":
-        return host_mapped_empty(shape, dtype=dtype, device=device)
+    if memory_mode == "hmm":
+        return hmm_empty(shape, dtype=dtype, device=device)
     if memory_mode == "device":
         return torch.empty(tuple(shape), dtype=dtype, device=device)
     raise ValueError(f"Unsupported memory_mode: {memory_mode}")
@@ -155,7 +168,7 @@ def prefetch_managed(tensor: torch.Tensor, *, location: str, device: torch.devic
     target = LOCATION_TO_CODE[location]
     if target == 0:
         target = int(device.index or 0)
-    mod.prefetch_(tensor, target)
+    mod.prefetch_(tensor, target, int(device.index or 0))
 
 
 def pointer_info(tensor: torch.Tensor) -> dict[str, object]:

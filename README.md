@@ -4,7 +4,7 @@
 
 ```bash
 cd GNN_cuda
-source ./setup_environment dataset_path
+source ./setup_environment <dataset_path>
 gnn_cuda_create_envs --build
 ```
 
@@ -19,28 +19,68 @@ gnn_cuda_create_envs --build
 
 ## Run
 
-Single dataset:
+<!-- Wrapper entrypoints:
 
 ```bash
-python run/GCN_inference.py --framework pyg --dataset cora
-python run/GIN_inference.py --framework dgl --dataset cora
-python run/SAG_inference.py --framework pyg --dataset cora
-```
-
-All datasets under the default dataset directory:
-
-```bash
+python run/GCN_inference.py --framework pyg --dataset Pubmed
+python run/GIN_inference.py --framework dgl --dataset Pubmed
+python run/SAG_inference.py --framework pyg --dataset Pubmed
 python run/GCN_inference.py --framework pyg --dataset all
 ```
 
+Direct inference entry used for previous manual experiments:
+
+```bash
+conda run -n cu128_pyg python GNN_PyG_cuda/GCN/inference.py \
+  --dataset Pubmed \
+  --num_layers 1 \
+  --dim 128 \
+  --adj_matrix device \
+  --ft_matrix uvm \
+  --weight device \
+  --warmup 1 \
+  --iters 5 \
+  --device cuda:0
+```
+-->
+
+Use the nsys wrapper below to print only average SpMM time and average migrated bytes during SpMM:
+
+```bash
+python run/profile_spmm_migration.py \
+  --framework pyg \
+  --model gcn \
+  --dataset Pubmed \
+  --num_layers 1 \
+  --dim 128 \
+  --adj_matrix device \
+  --ft_matrix uvm \
+  --weight device \
+  --warmup 1 \
+  --iters 5 \
+  --device cuda:0
+```
+
+Output:
+
+```text
+Summary Report:
+spmm_ns, ...
+migrated_bytes, ...
+```
+
+`migrated_bytes` is the average per measured iteration of `HtoD + DtoH` migration bytes inside NVTX `aggregation` ranges.
+
 ## Arguments
 
-- `--framework`: backend frontend, `pyg` or `dgl`
-- `--dataset`: dataset name or `all`
+- `--framework`: `pyg` or `dgl`
+- `--model`: `gcn`, `gin`, or `sag`
+- `--dataset`: dataset name
 - `--dim`: base feature / hidden / output dimension, default `128`
-- `--num_layers`: number of layers
-- `--graph_memory_mode`: graph-input placement, `device`, `uvm`, or `host_mapped`
-- `--compute_memory_mode`: weights / outputs / scratch placement, `device` or `uvm`
+- `--num_layers`: number of layers, default `1`
+- `--adj_matrix`: adjacency / CSR placement, `device`, `uvm`, or `hmm`
+- `--ft_matrix`: feature placement, `device`, `uvm`, or `hmm`
+- `--weight`: weights / outputs / scratch placement, `device` or `uvm`
 - `--device`: execution device, for example `cuda:0`
 - `--warmup`: number of warmup iterations, default `1`
 - `--iters`: number of measured iterations, default `5`
@@ -49,4 +89,4 @@ Memory modes:
 
 - `device`: regular CUDA device memory
 - `uvm`: `cudaMallocManaged`-based UVM
-- `host_mapped`: current host-mapped graph-input path
+- `hmm`: ordinary system-memory graph-input path for Linux HMM

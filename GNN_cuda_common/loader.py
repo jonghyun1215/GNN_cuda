@@ -16,6 +16,7 @@ _BUILD_ROOT = _REPO_ROOT / "build"
 _ALLOCATOR_MODULE = None
 _GCN_MODULE = None
 _AGG_MODULE = None
+_PYG_GCN_MODULE = None
 
 
 def _torch_build_tag() -> str:
@@ -76,6 +77,16 @@ def load_gcn_module():
             ["gcn_ops.cpp", "gcn_ops.cu"],
         )
     return _GCN_MODULE
+
+
+def load_pyg_gcn_module():
+    global _PYG_GCN_MODULE
+    if _PYG_GCN_MODULE is None:
+        _PYG_GCN_MODULE = _load_native(
+            "gnn_pyg_gcn_cuda",
+            ["pyg_gcn_ops.cpp", "pyg_gcn_ops.cu"],
+        )
+    return _PYG_GCN_MODULE
 
 
 def load_agg_module():

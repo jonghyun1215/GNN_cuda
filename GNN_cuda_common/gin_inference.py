@@ -12,7 +12,7 @@ from typing import Callable
 import torch
 from torch import nn
 
-from .agg_ops import linear_forward_, spmm_sum_forward_, tensor_add_inplace_
+from .agg_ops import bias_relu_forward_, gemm_forward_, spmm_sum_forward_, tensor_add_inplace_
 from .allocator import (
     COMPUTE_MEMORY_MODES,
     GRAPH_MEMORY_MODES,
@@ -20,12 +20,14 @@ from .allocator import (
     allocate_empty,
     allocate_like_mode,
     apply_managed_policy,
-    is_uvm_mode,
     normalize_memory_mode,
     pointer_info,
+    prefers_hmm_spmm,
     prefetch_managed,
+    uses_cuda_memory_hints,
 )
 from .graph_utils import build_plain_csr, load_src_dst_features, resolve_dataset_path
+from .phase_summary import PhaseSummary, print_summary_report
 
 
 def _autocast_context(use_amp: bool, device: torch.device):
@@ -81,7 +83,7 @@ def _describe_memory(name: str, tensor: torch.Tensor) -> str:
     )
 
 
-def _apply_policy_if_uvm(
+def _apply_policy_if_needed(
     tensor: torch.Tensor,
     *,
     memory_mode: str,
@@ -89,7 +91,7 @@ def _apply_policy_if_uvm(
     device: torch.device,
     read_mostly: bool,
 ) -> None:
-    if not is_uvm_mode(memory_mode):
+    if not uses_cuda_memory_hints(memory_mode):
         return
     apply_managed_policy(
         tensor,
@@ -154,7 +156,7 @@ def _make_layer_state(
     hidden_buffer = allocate_empty((num_nodes, out_dim), dtype=torch.float32, device=device, memory_mode=memory_mode)
     out_buffer = allocate_empty((num_nodes, out_dim), dtype=torch.float32, device=device, memory_mode=memory_mode)
     for tensor in (weight1, bias1, weight2, bias2, eps, agg_buffer, hidden_buffer, out_buffer):
-        _apply_policy_if_uvm(
+        _apply_policy_if_needed(
             tensor,
             memory_mode=memory_mode,
             managed_cfg=managed_cfg,
@@ -191,9 +193,12 @@ def run_gin_inference(
     parser.add_argument("--num_layers", type=int, default=2, help="number of GIN layers")
     parser.add_argument("--learn_eps", action="store_true", help="allocate epsilon as a learnable-style state tensor")
     parser.add_argument("--use_npz_features", action="store_true", help="use sparse features saved in npz if present")
-    parser.add_argument("--memory_mode", type=str, default="uvm", help="shared fallback backend for graph/compute allocation: device or uvm; legacy aliases managed/torch_cuda are also accepted")
-    parser.add_argument("--graph_memory_mode", type=str, default=None, help="graph backend for CSR/features inputs: device, uvm, host_mapped; legacy aliases managed/torch_cuda are also accepted")
-    parser.add_argument("--compute_memory_mode", type=str, default=None, help="compute backend for weights/outputs/scratch: device or uvm; legacy aliases managed/torch_cuda are also accepted")
+    parser.add_argument("--memory_mode", type=str, default="uvm", help="shared fallback backend for adjacency/features/weight allocation: device, uvm, or hmm; legacy aliases managed/torch_cuda are also accepted")
+    parser.add_argument("--graph_memory_mode", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--adj_matrix", type=str, default=None, help="adjacency backend for CSR inputs: device, uvm, hmm")
+    parser.add_argument("--ft_matrix", type=str, default=None, help="feature backend for node feature tensors: device, uvm, hmm")
+    parser.add_argument("--weight", type=str, default=None, help="compute backend for weights/outputs/scratch: device or uvm")
+    parser.add_argument("--compute_memory_mode", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--preferred_location", type=str, default="cuda", choices=["none", "cpu", "cuda"], help="UVM preferred location hint")
     parser.add_argument("--accessed_by_cpu", action="store_true", help="mark UVM tensors as CPU-accessible")
     parser.add_argument("--accessed_by_cuda", action="store_true", help="mark UVM tensors as GPU-accessible")
@@ -218,20 +223,28 @@ def run_gin_inference(
     if args.amp:
         raise ValueError("The CUDA GIN prototype only supports float32 today.")
     nvtx_enabled = bool(args.nvtx and device.type == "cuda")
-    shared_memory_mode = normalize_memory_mode(args.memory_mode, allow_host_mapped=True)
-    graph_memory_mode = normalize_memory_mode(args.graph_memory_mode or shared_memory_mode, allow_host_mapped=True)
+    phase_summary = PhaseSummary(device)
+    shared_memory_mode = normalize_memory_mode(args.memory_mode, allow_hmm=True)
+    graph_fallback_mode = args.graph_memory_mode or shared_memory_mode
+    adj_memory_mode = normalize_memory_mode(args.adj_matrix or graph_fallback_mode, allow_hmm=True)
+    ft_memory_mode = normalize_memory_mode(args.ft_matrix or graph_fallback_mode, allow_hmm=True)
     try:
-        compute_memory_mode = normalize_memory_mode(args.compute_memory_mode or shared_memory_mode, allow_host_mapped=False)
+        weight_memory_mode = normalize_memory_mode(args.weight or args.compute_memory_mode or shared_memory_mode, allow_hmm=False)
     except ValueError as exc:
         raise ValueError(
-            f"compute_memory_mode expects one of {COMPUTE_MEMORY_MODES}; use --graph_memory_mode host_mapped with --compute_memory_mode uvm/device"
+            f"weight expects one of {COMPUTE_MEMORY_MODES}; use --adj_matrix/--ft_matrix hmm with --weight uvm/device"
         ) from exc
     args.memory_mode = shared_memory_mode
-    args.graph_memory_mode = graph_memory_mode
-    args.compute_memory_mode = compute_memory_mode
+    args.adj_matrix = adj_memory_mode
+    args.ft_matrix = ft_memory_mode
+    args.weight = weight_memory_mode
     print(args)
-    if graph_memory_mode == "host_mapped" and device.type != "cuda":
-        raise ValueError(f"graph_memory_mode expects one of {GRAPH_MEMORY_MODES} on CUDA; 'host_mapped' requires a CUDA device")
+    if "hmm" in (adj_memory_mode, ft_memory_mode) and device.type != "cuda":
+        raise ValueError(
+            f"adj_matrix/ft_matrix expect one of {GRAPH_MEMORY_MODES} on CUDA; 'hmm' requires a CUDA device"
+        )
+    use_hmm_spmm = prefers_hmm_spmm(adj_memory_mode, ft_memory_mode)
+    spmm_kernel = "hmm_optimized" if use_hmm_spmm else "baseline"
     managed_cfg = ManagedAllocationConfig(
         preferred_location=str(args.preferred_location),
         accessed_by_cpu=bool(args.accessed_by_cpu),
@@ -240,73 +253,92 @@ def run_gin_inference(
         prefetch_to=str(args.prefetch_to),
     )
 
-    graph_path = resolve_dataset_path(str(args.dataset), data_root=str(args.data_root))
-    loaded = load_graph_features(
-        graph_path,
-        feat_dim=args.feat_dim,
-        use_npz_features=args.use_npz_features,
-    )
-    src, dst, features_cpu, num_nodes = load_src_dst_features(loaded, load_kind=load_kind)
-    num_edges = int(src.numel())
+    with phase_summary.measure("graph_prep", use_cuda_events=False):
+        graph_path = resolve_dataset_path(str(args.dataset), data_root=str(args.data_root))
+        loaded = load_graph_features(
+            graph_path,
+            feat_dim=args.feat_dim,
+            use_npz_features=args.use_npz_features,
+        )
+        src, dst, features_cpu, num_nodes = load_src_dst_features(loaded, load_kind=load_kind)
+        num_edges = int(src.numel())
 
-    csr = build_plain_csr(src, dst, num_nodes=num_nodes, add_self_loops=False, transpose_for_incoming=True)
-    features_cpu = features_cpu.contiguous().to(dtype=torch.float32)
+        csr = build_plain_csr(src, dst, num_nodes=num_nodes, add_self_loops=False, transpose_for_incoming=True)
+        features_cpu = features_cpu.contiguous().to(dtype=torch.float32)
 
-    row_ptr = allocate_like_mode(csr.row_ptr, memory_mode=graph_memory_mode, device=device)
-    col_ind = allocate_like_mode(csr.col_ind, memory_mode=graph_memory_mode, device=device)
-    features = allocate_like_mode(features_cpu, memory_mode=graph_memory_mode, device=device)
-    for tensor in (row_ptr, col_ind):
-        _apply_policy_if_uvm(
-            tensor,
-            memory_mode=graph_memory_mode,
+        row_ptr = allocate_like_mode(csr.row_ptr, memory_mode=adj_memory_mode, device=device)
+        col_ind = allocate_like_mode(csr.col_ind, memory_mode=adj_memory_mode, device=device)
+        features = allocate_like_mode(features_cpu, memory_mode=ft_memory_mode, device=device)
+        for tensor in (row_ptr, col_ind):
+            _apply_policy_if_needed(
+                tensor,
+                memory_mode=adj_memory_mode,
+                managed_cfg=managed_cfg,
+                device=device,
+                read_mostly=managed_cfg.read_mostly_graph,
+            )
+        _apply_policy_if_needed(
+            features,
+            memory_mode=ft_memory_mode,
             managed_cfg=managed_cfg,
             device=device,
-            read_mostly=managed_cfg.read_mostly_graph,
+            read_mostly=False,
         )
-    _apply_policy_if_uvm(
-        features,
-        memory_mode=graph_memory_mode,
-        managed_cfg=managed_cfg,
-        device=device,
-        read_mostly=False,
-    )
 
-    layer_states = [
-        _make_layer_state(
-            in_dim=in_dim,
-            out_dim=out_dim,
-            num_nodes=int(num_nodes),
-            device=device,
-            memory_mode=compute_memory_mode,
-            managed_cfg=managed_cfg,
-            learn_eps=bool(args.learn_eps),
-        )
-        for in_dim, out_dim in _build_layer_dims(int(features.size(1)), int(args.hidden_dim), int(args.out_dim), int(args.num_layers))
-    ]
+        layer_states = [
+            _make_layer_state(
+                in_dim=in_dim,
+                out_dim=out_dim,
+                num_nodes=int(num_nodes),
+                device=device,
+                memory_mode=weight_memory_mode,
+                managed_cfg=managed_cfg,
+                learn_eps=bool(args.learn_eps),
+            )
+            for in_dim, out_dim in _build_layer_dims(int(features.size(1)), int(args.hidden_dim), int(args.out_dim), int(args.num_layers))
+        ]
 
     def forward_once() -> torch.Tensor:
         x = features
         for idx, layer in enumerate(layer_states):
             tag = f"layer{idx + 1}"
             with _nvtx_range(nvtx_enabled, f"{tag}/aggregation"):
-                spmm_sum_forward_(row_ptr, col_ind, x, layer.agg_buffer)
+                with phase_summary.measure("spmm"):
+                    spmm_sum_forward_(
+                        row_ptr,
+                        col_ind,
+                        x,
+                        layer.agg_buffer,
+                        hmm_optimized=use_hmm_spmm,
+                    )
             with _nvtx_range(nvtx_enabled, f"{tag}/epilogue"):
-                tensor_add_inplace_(layer.agg_buffer, x, alpha=1.0 + float(layer.eps.item()))
+                with phase_summary.measure("epilogue"):
+                    tensor_add_inplace_(layer.agg_buffer, x, alpha=1.0 + float(layer.eps.item()))
             with _nvtx_range(nvtx_enabled, f"{tag}/dense_update"):
-                linear_forward_(
-                    layer.agg_buffer,
-                    layer.weight1,
-                    layer.bias1,
-                    layer.hidden_buffer,
-                    relu=True,
-                )
-                linear_forward_(
-                    layer.hidden_buffer,
-                    layer.weight2,
-                    layer.bias2,
-                    layer.out_buffer,
-                    relu=post_layer_relu and idx != len(layer_states) - 1,
-                )
+                with phase_summary.measure("gemm"):
+                    gemm_forward_(
+                        layer.agg_buffer,
+                        layer.weight1,
+                        layer.hidden_buffer,
+                    )
+                with phase_summary.measure("epilogue"):
+                    bias_relu_forward_(
+                        layer.hidden_buffer,
+                        layer.bias1,
+                        relu=True,
+                    )
+                with phase_summary.measure("gemm"):
+                    gemm_forward_(
+                        layer.hidden_buffer,
+                        layer.weight2,
+                        layer.out_buffer,
+                    )
+                with phase_summary.measure("epilogue"):
+                    bias_relu_forward_(
+                        layer.out_buffer,
+                        layer.bias2,
+                        relu=post_layer_relu and idx != len(layer_states) - 1,
+                    )
             x = layer.out_buffer
         return x
 
@@ -316,6 +348,7 @@ def run_gin_inference(
                 forward_once()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+        phase_summary.reset()
 
         _cuda_profiler_start(device)
         start = time.perf_counter()
@@ -323,6 +356,7 @@ def run_gin_inference(
             with _nvtx_range(nvtx_enabled, "iteration"):
                 with _autocast_context(False, device):
                     output = forward_once()
+            phase_summary.record_iteration(("spmm", "gemm", "epilogue"))
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - start
@@ -330,8 +364,10 @@ def run_gin_inference(
 
     print(f"Graph:\t{graph_path}")
     print(f"Impl:\t{framework_label}_gin_cuda")
-    print(f"Graph Memory Mode:\t{graph_memory_mode}")
-    print(f"Compute Memory Mode:\t{compute_memory_mode}")
+    print(f"Adjacency Memory Mode:\t{adj_memory_mode}")
+    print(f"Feature Memory Mode:\t{ft_memory_mode}")
+    print(f"Weight Memory Mode:\t{weight_memory_mode}")
+    print(f"SpMM Kernel:\t{spmm_kernel}")
     print(f"Nodes:\t{num_nodes}")
     print(f"Edges:\t{num_edges}")
     print(_describe_memory("row_ptr", row_ptr))
@@ -340,5 +376,7 @@ def run_gin_inference(
     print(_describe_memory("weights1_l0", layer_states[0].weight1))
     print(_describe_memory("output", output))
     print(f"Output Sum:\t{float(output.sum().item()):.6f}")
-    print(f"Infer (ns):\t{elapsed * 1e9 / args.iters:.3f}")
+    infer_avg_ns = elapsed * 1e9 / args.iters
+    print(f"Infer (ns):\t{infer_avg_ns:.3f}")
+    print_summary_report(phase_summary, iters=int(args.iters), infer_avg_ns=infer_avg_ns)
     return 0

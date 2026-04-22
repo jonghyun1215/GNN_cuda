@@ -35,9 +35,41 @@ int64_t multiply_sizes(const std::vector<int64_t> &sizes) {
   return numel;
 }
 
-void check_cuda_tensor(const torch::Tensor &tensor) {
-  TORCH_CHECK(tensor.is_cuda(), "Expected a CUDA tensor");
+void check_supported_tensor(const torch::Tensor &tensor) {
+  TORCH_CHECK(tensor.is_cuda() || tensor.device().is_cpu(),
+              "Expected a CPU or CUDA tensor");
   TORCH_CHECK(tensor.is_contiguous(), "Expected a contiguous tensor");
+}
+
+bool device_supports_pageable_memory_access(int device_index) {
+  int pageable = 0;
+  C10_CUDA_CHECK(
+      cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess,
+                             device_index));
+  return pageable != 0;
+}
+
+void ensure_hmm_supported(int device_index) {
+  TORCH_CHECK(device_supports_pageable_memory_access(device_index),
+              "The selected CUDA device does not support Linux HMM pageable "
+              "memory access");
+}
+
+bool current_device_supports_pageable_memory_access() {
+  int device_index = 0;
+  cudaError_t status = cudaGetDevice(&device_index);
+  if (status != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  int pageable = 0;
+  status = cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess,
+                                  device_index);
+  if (status != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return pageable != 0;
 }
 
 std::string pointer_type_name(cudaMemoryType type) {
@@ -84,36 +116,21 @@ torch::Tensor managed_empty_cuda(std::vector<int64_t> sizes, int dtype_code,
   return tensor;
 }
 
-torch::Tensor host_mapped_empty_cpu(std::vector<int64_t> sizes, int dtype_code,
-                                    int device_index) {
+torch::Tensor hmm_empty_cpu(std::vector<int64_t> sizes, int dtype_code,
+                            int device_index) {
   TORCH_CHECK(device_index >= 0, "device_index must be >= 0");
+  ensure_hmm_supported(device_index);
   const auto dtype = decode_dtype(dtype_code);
-  const int64_t numel = multiply_sizes(sizes);
-  const size_t bytes = static_cast<size_t>(numel) * c10::elementSize(dtype);
-
-  at::cuda::CUDAGuard device_guard(device_index);
-  void *ptr = nullptr;
-  if (bytes > 0) {
-    C10_CUDA_CHECK(
-        cudaHostAlloc(&ptr, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
-    void *device_ptr = nullptr;
-    C10_CUDA_CHECK(cudaHostGetDevicePointer(&device_ptr, ptr, 0));
-    TORCH_CHECK(device_ptr != nullptr,
-                "Mapped host allocation did not expose a device pointer");
-  }
   auto options = torch::TensorOptions().device(torch::kCPU).dtype(dtype);
-  auto deleter = [](void *memory) {
-    if (memory == nullptr) {
-      return;
-    }
-    cudaFreeHost(memory);
-  };
-  return torch::from_blob(ptr, sizes, deleter, options);
+  return torch::empty(sizes, options);
 }
 
-void prefetch_cuda_(torch::Tensor tensor, int location_code) {
-  check_cuda_tensor(tensor);
-  auto device_index = tensor.get_device();
+void prefetch_cuda_(torch::Tensor tensor, int location_code, int device_index) {
+  check_supported_tensor(tensor);
+  TORCH_CHECK(device_index >= 0, "device_index must be >= 0");
+  if (tensor.device().is_cpu()) {
+    ensure_hmm_supported(device_index);
+  }
   at::cuda::CUDAGuard device_guard(device_index);
   auto stream = at::cuda::getDefaultCUDAStream(device_index);
   C10_CUDA_CHECK(cudaMemPrefetchAsync(tensor.data_ptr(), tensor.nbytes(),
@@ -122,7 +139,10 @@ void prefetch_cuda_(torch::Tensor tensor, int location_code) {
 
 void advise_preferred_location_cuda_(torch::Tensor tensor, int location_code,
                                      int device_index) {
-  check_cuda_tensor(tensor);
+  check_supported_tensor(tensor);
+  if (tensor.device().is_cpu()) {
+    ensure_hmm_supported(device_index);
+  }
   at::cuda::CUDAGuard device_guard(device_index);
   C10_CUDA_CHECK(cudaMemAdvise(tensor.data_ptr(), tensor.nbytes(),
                                cudaMemAdviseSetPreferredLocation,
@@ -132,7 +152,10 @@ void advise_preferred_location_cuda_(torch::Tensor tensor, int location_code,
 
 void advise_accessed_by_cuda_(torch::Tensor tensor, int location_code,
                               int device_index) {
-  check_cuda_tensor(tensor);
+  check_supported_tensor(tensor);
+  if (tensor.device().is_cpu()) {
+    ensure_hmm_supported(device_index);
+  }
   at::cuda::CUDAGuard device_guard(device_index);
   C10_CUDA_CHECK(cudaMemAdvise(tensor.data_ptr(), tensor.nbytes(),
                                cudaMemAdviseSetAccessedBy,
@@ -141,8 +164,14 @@ void advise_accessed_by_cuda_(torch::Tensor tensor, int location_code,
 }
 
 void advise_read_mostly_cuda_(torch::Tensor tensor, bool enabled) {
-  check_cuda_tensor(tensor);
-  auto device_index = tensor.get_device();
+  check_supported_tensor(tensor);
+  int device_index = tensor.is_cuda() ? tensor.get_device() : 0;
+  if (tensor.device().is_cpu()) {
+    int current_device = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&current_device));
+    device_index = current_device;
+    ensure_hmm_supported(device_index);
+  }
   at::cuda::CUDAGuard device_guard(device_index);
   const auto advise =
       enabled ? cudaMemAdviseSetReadMostly : cudaMemAdviseUnsetReadMostly;
@@ -158,6 +187,7 @@ pybind11::dict pointer_info_cuda(torch::Tensor tensor) {
                                                     : -1;
   out["is_managed"] = false;
   out["is_host_mapped"] = false;
+  out["is_hmm"] = false;
   out["pointer_type"] = tensor.device().is_cpu() ? std::string("cpu")
                                                  : std::string("unknown");
 
@@ -169,13 +199,22 @@ pybind11::dict pointer_info_cuda(torch::Tensor tensor) {
   cudaError_t status = cudaPointerGetAttributes(&attrs, tensor.data_ptr());
   if (status != cudaSuccess) {
     cudaGetLastError();
+    if (tensor.device().is_cpu() && current_device_supports_pageable_memory_access()) {
+      out["is_hmm"] = true;
+      out["pointer_type"] = std::string("hmm");
+    }
     return out;
   }
   out["is_managed"] = attrs.type == cudaMemoryTypeManaged;
   const bool is_host_mapped =
       attrs.type == cudaMemoryTypeHost && attrs.devicePointer != nullptr;
   out["is_host_mapped"] = is_host_mapped;
-  out["pointer_type"] =
-      is_host_mapped ? std::string("host_mapped") : pointer_type_name(attrs.type);
+  const bool is_hmm = tensor.device().is_cpu() && !is_host_mapped &&
+                      current_device_supports_pageable_memory_access();
+  out["is_hmm"] = is_hmm;
+  out["pointer_type"] = is_host_mapped
+                            ? std::string("host_mapped")
+                            : (is_hmm ? std::string("hmm")
+                                      : pointer_type_name(attrs.type));
   return out;
 }

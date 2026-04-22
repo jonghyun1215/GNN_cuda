@@ -4,9 +4,9 @@
 
 torch::Tensor managed_empty_cuda(std::vector<int64_t> sizes, int dtype_code,
                                  int device_index);
-torch::Tensor host_mapped_empty_cpu(std::vector<int64_t> sizes, int dtype_code,
-                                    int device_index);
-void prefetch_cuda_(torch::Tensor tensor, int location_code);
+torch::Tensor hmm_empty_cpu(std::vector<int64_t> sizes, int dtype_code,
+                            int device_index);
+void prefetch_cuda_(torch::Tensor tensor, int location_code, int device_index);
 void advise_preferred_location_cuda_(torch::Tensor tensor, int location_code,
                                      int device_index);
 void advise_accessed_by_cuda_(torch::Tensor tensor, int location_code,
@@ -17,8 +17,8 @@ pybind11::dict pointer_info_cuda(torch::Tensor tensor);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("managed_empty", &managed_empty_cuda,
         "Allocate a CUDA tensor backed by cudaMallocManaged");
-  m.def("host_mapped_empty", &host_mapped_empty_cpu,
-        "Allocate a CPU tensor backed by cudaHostAllocMapped");
+  m.def("hmm_empty", &hmm_empty_cpu,
+        "Allocate a CPU tensor backed by ordinary system memory for HMM");
   m.def("prefetch_", &prefetch_cuda_, "Prefetch a managed tensor");
   m.def("advise_preferred_location_", &advise_preferred_location_cuda_,
         "Set cudaMemAdviseSetPreferredLocation");

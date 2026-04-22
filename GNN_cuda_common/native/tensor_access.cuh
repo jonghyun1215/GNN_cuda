@@ -4,6 +4,24 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+inline bool current_device_supports_pageable_memory_access() {
+  int device_index = 0;
+  cudaError_t status = cudaGetDevice(&device_index);
+  if (status != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+
+  int pageable = 0;
+  status = cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess,
+                                  device_index);
+  if (status != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return pageable != 0;
+}
+
 inline void *get_device_accessible_void_ptr(const torch::Tensor &tensor) {
   if (tensor.numel() == 0) {
     return nullptr;
@@ -16,10 +34,19 @@ inline void *get_device_accessible_void_ptr(const torch::Tensor &tensor) {
 
   cudaPointerAttributes attrs;
   cudaError_t status = cudaPointerGetAttributes(&attrs, tensor.data_ptr());
-  if (status != cudaSuccess) {
+  if (status == cudaSuccess) {
+    if (attrs.type == cudaMemoryTypeHost && attrs.devicePointer != nullptr) {
+      return attrs.devicePointer;
+    }
+    if (attrs.type == cudaMemoryTypeUnregistered &&
+        current_device_supports_pageable_memory_access()) {
+      return tensor.data_ptr();
+    }
+  } else {
     cudaGetLastError();
-    TORCH_CHECK(false,
-                "CPU tensor is not backed by CUDA-mapped host memory");
+    if (current_device_supports_pageable_memory_access()) {
+      return tensor.data_ptr();
+    }
   }
 
   void *device_ptr = attrs.devicePointer;
@@ -44,4 +71,3 @@ template <typename T>
 inline const T *get_device_accessible_const_ptr(const torch::Tensor &tensor) {
   return static_cast<const T *>(get_device_accessible_void_ptr(tensor));
 }
-
