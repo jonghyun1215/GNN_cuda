@@ -120,7 +120,7 @@ def _build_profiled_cmd(args: argparse.Namespace) -> list[str]:
 
 
 def _export_sqlite(rep_path: Path, sqlite_base: Path) -> Path:
-    subprocess.run(
+    result = subprocess.run(
         [
             "nsys",
             "export",
@@ -136,10 +136,18 @@ def _export_sqlite(rep_path: Path, sqlite_base: Path) -> Path:
         capture_output=True,
         text=True,
     )
-    sqlite_path = sqlite_base.with_suffix(".sqlite")
-    if not sqlite_path.exists():
-        raise FileNotFoundError(f"expected sqlite export not found: {sqlite_path}")
-    return sqlite_path
+    candidates = [sqlite_base]
+    sqlite_with_suffix = sqlite_base.with_suffix(".sqlite")
+    if sqlite_with_suffix != sqlite_base:
+        candidates.append(sqlite_with_suffix)
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    candidate_text = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "expected sqlite export not found; looked for "
+        f"{candidate_text}\nnsys stdout:\n{result.stdout}\nnsys stderr:\n{result.stderr}"
+    )
 
 
 def _fetch_nvtx_ranges(sqlite_path: Path) -> tuple[list[TimeRange], list[TimeRange]]:
