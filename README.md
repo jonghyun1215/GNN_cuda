@@ -44,21 +44,12 @@ conda run -n cu128_pyg python GNN_PyG_cuda/GCN/inference.py \
 ```
 -->
 
-Use the nsys wrapper below to print only average SpMM time and average migrated bytes during SpMM:
+Use the nsys wrapper below to print average SpMM time and UM migration metrics during SpMM:
 
 ```bash
 python run/profile_spmm_migration.py \
-  --framework pyg \
-  --model gcn \
   --dataset Pubmed \
-  --num_layers 1 \
-  --dim 128 \
-  --adj_matrix device \
-  --ft_matrix uvm \
-  --weight device \
-  --warmup 1 \
-  --iters 5 \
-  --device cuda:0
+  --ft_matrix uvm
 ```
 
 Output:
@@ -66,22 +57,24 @@ Output:
 ```text
 Summary Report:
 spmm_ns, ...
-migrated_bytes, ...
+HtoD_bytes, ...
+DtoH_bytes, ...
+GPU_faults, ...
 ```
 
-`migrated_bytes` is the average per measured iteration of `HtoD + DtoH` migration bytes inside NVTX `aggregation` ranges.
+All reported UM metrics are averaged per measured iteration over NVTX `aggregation` ranges.
 
 ## Arguments
 
-- `--framework`: `pyg` or `dgl`
-- `--model`: `gcn`, `gin`, or `sag`
-- `--dataset`: dataset name
+- `--dataset`: dataset name, required
+- `--ft_matrix`: feature placement, `device`, `uvm`, or `hmm`, required
+- `--framework`: `pyg` or `dgl`, default `pyg`
+- `--model`: `gcn`, `gin`, or `sag`, default `gcn`
 - `--dim`: base feature / hidden / output dimension, default `128`
 - `--num_layers`: number of layers, default `1`
-- `--adj_matrix`: adjacency / CSR placement, `device`, `uvm`, or `hmm`
-- `--ft_matrix`: feature placement, `device`, `uvm`, or `hmm`
-- `--weight`: weights / outputs / scratch placement, `device` or `uvm`
-- `--device`: execution device, for example `cuda:0`
+- `--adj_matrix`: adjacency / CSR placement, `device`, `uvm`, or `hmm`, default `device`
+- `--weight`: weights / outputs / scratch placement, `device` or `uvm`, default `device`
+- `--device`: execution device, default `cuda:0`
 - `--warmup`: number of warmup iterations, default `1`
 - `--iters`: number of measured iterations, default `5`
 

@@ -35,6 +35,20 @@ class TimeRange:
         return max(0, self.end_ns - self.start_ns)
 
 
+@dataclass(frozen=True)
+class UmTotals:
+    htod_bytes: float = 0.0
+    dtoh_bytes: float = 0.0
+    gpu_faults: float = 0.0
+
+    def __add__(self, other: "UmTotals") -> "UmTotals":
+        return UmTotals(
+            htod_bytes=self.htod_bytes + other.htod_bytes,
+            dtoh_bytes=self.dtoh_bytes + other.dtoh_bytes,
+            gpu_faults=self.gpu_faults + other.gpu_faults,
+        )
+
+
 def _run(cmd: list[str], *, stdout_path: Path | None = None, stderr_path: Path | None = None) -> None:
     kwargs = {"check": True, "text": True}
     if stdout_path is not None:
@@ -210,7 +224,7 @@ def _to_float(value: str) -> float:
     return float(cleaned) if cleaned else 0.0
 
 
-def _um_total_bytes(sqlite_path: Path, time_range: TimeRange) -> float:
+def _um_total_stats(sqlite_path: Path, time_range: TimeRange) -> UmTotals:
     cmd = [
         "nsys",
         "stats",
@@ -225,19 +239,23 @@ def _um_total_bytes(sqlite_path: Path, time_range: TimeRange) -> float:
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError:
-        return 0.0
+        return UmTotals()
 
     rows = _csv_rows_from_stats(
         result.stdout,
-        ("Total HtoD Migration Size", "Total DtoH Migration Size"),
+        ("Total HtoD Migration Size", "Total DtoH Migration Size", "Total GPU Page Faults"),
     )
     if not rows:
-        return 0.0
+        return UmTotals()
     row = rows[0]
-    return _to_float(row.get("Total HtoD Migration Size", "0")) + _to_float(row.get("Total DtoH Migration Size", "0"))
+    return UmTotals(
+        htod_bytes=_to_float(row.get("Total HtoD Migration Size", "0")),
+        dtoh_bytes=_to_float(row.get("Total DtoH Migration Size", "0")),
+        gpu_faults=_to_float(row.get("Total GPU Page Faults", "0")),
+    )
 
 
-def _summarize(sqlite_path: Path) -> tuple[float, float]:
+def _summarize(sqlite_path: Path) -> tuple[float, UmTotals]:
     iteration_ranges, aggregation_ranges = _fetch_nvtx_ranges(sqlite_path)
     if not aggregation_ranges:
         raise RuntimeError("no NVTX aggregation ranges found; make sure the target command ran with --nvtx")
@@ -246,37 +264,45 @@ def _summarize(sqlite_path: Path) -> tuple[float, float]:
         iteration_ranges = aggregation_ranges
 
     per_iter_spmm_ns: list[float] = []
-    per_iter_migrated_bytes: list[float] = []
+    per_iter_um_totals: list[UmTotals] = []
     for iteration in iteration_ranges:
         matching_aggs = [agg for agg in aggregation_ranges if _overlaps(agg, iteration)]
         if not matching_aggs:
             continue
         iter_spmm_ns = float(sum(agg.duration_ns for agg in matching_aggs))
-        iter_bytes = float(sum(_um_total_bytes(sqlite_path, agg) for agg in matching_aggs))
+        iter_um_totals = UmTotals()
+        for agg in matching_aggs:
+            iter_um_totals = iter_um_totals + _um_total_stats(sqlite_path, agg)
         per_iter_spmm_ns.append(iter_spmm_ns)
-        per_iter_migrated_bytes.append(iter_bytes)
+        per_iter_um_totals.append(iter_um_totals)
 
     if not per_iter_spmm_ns:
         raise RuntimeError("no aggregation ranges overlapped measured iteration ranges")
 
     avg_spmm_ns = sum(per_iter_spmm_ns) / float(len(per_iter_spmm_ns))
-    avg_migrated_bytes = sum(per_iter_migrated_bytes) / float(len(per_iter_migrated_bytes))
-    return avg_spmm_ns, avg_migrated_bytes
+    avg_um_totals = UmTotals(
+        htod_bytes=sum(item.htod_bytes for item in per_iter_um_totals) / float(len(per_iter_um_totals)),
+        dtoh_bytes=sum(item.dtoh_bytes for item in per_iter_um_totals) / float(len(per_iter_um_totals)),
+        gpu_faults=sum(item.gpu_faults for item in per_iter_um_totals) / float(len(per_iter_um_totals)),
+    )
+    return avg_spmm_ns, avg_um_totals
 
 
-def _write_summary(path: Path, spmm_ns: float, migrated_bytes: float) -> None:
+def _write_summary(path: Path, spmm_ns: float, um_totals: UmTotals) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "Summary Report:\n"
         f"spmm_ns, {spmm_ns:.3f}\n"
-        f"migrated_bytes, {migrated_bytes:.3f}\n",
+        f"HtoD_bytes, {um_totals.htod_bytes:.3f}\n"
+        f"DtoH_bytes, {um_totals.dtoh_bytes:.3f}\n"
+        f"GPU_faults, {um_totals.gpu_faults:.3f}\n",
         encoding="utf-8",
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Profile GNN inference with nsys and print average SpMM time and migrated bytes during SpMM."
+        description="Profile GNN inference with nsys and print average SpMM time plus UM migration metrics during SpMM."
     )
     parser.add_argument("--framework", type=str, default="pyg", choices=("pyg", "dgl"), help="frontend/backend stack")
     parser.add_argument("--model", type=str, default="gcn", choices=("gcn", "gin", "sag", "graphsage"), help="model to profile")
@@ -285,7 +311,7 @@ def main() -> int:
     parser.add_argument("--dim", type=int, default=128, help="base feature / hidden / output dimension")
     parser.add_argument("--num_layers", type=int, default=1, help="number of layers")
     parser.add_argument("--adj_matrix", type=str, default="device", choices=("device", "uvm", "hmm"), help="adjacency memory mode")
-    parser.add_argument("--ft_matrix", type=str, default="uvm", choices=("device", "uvm", "hmm"), help="feature memory mode")
+    parser.add_argument("--ft_matrix", type=str, required=True, choices=("device", "uvm", "hmm"), help="feature memory mode")
     parser.add_argument("--weight", type=str, default="device", choices=("device", "uvm"), help="weight/output memory mode")
     parser.add_argument("--warmup", type=int, default=1, help="warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="measured iterations")
@@ -338,12 +364,14 @@ def main() -> int:
         raise FileNotFoundError(f"expected nsys report not found: {rep_path}")
 
     sqlite_path = _export_sqlite(rep_path, sqlite_base)
-    avg_spmm_ns, avg_migrated_bytes = _summarize(sqlite_path)
-    _write_summary(summary_path, avg_spmm_ns, avg_migrated_bytes)
+    avg_spmm_ns, avg_um_totals = _summarize(sqlite_path)
+    _write_summary(summary_path, avg_spmm_ns, avg_um_totals)
 
     print("Summary Report:")
     print(f"spmm_ns, {avg_spmm_ns:.3f}")
-    print(f"migrated_bytes, {avg_migrated_bytes:.3f}")
+    print(f"HtoD_bytes, {avg_um_totals.htod_bytes:.3f}")
+    print(f"DtoH_bytes, {avg_um_totals.dtoh_bytes:.3f}")
+    print(f"GPU_faults, {avg_um_totals.gpu_faults:.3f}")
     return 0
 
 
