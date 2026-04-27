@@ -220,7 +220,12 @@ def run_gcn_inference(
     parser.add_argument("--warmup", type=int, default=1, help="warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="inference iterations")
     parser.add_argument("--device", type=str, default="cuda:0", help="device string")
-    parser.add_argument("--reserve_device_gb", type=float, default=0.0, help="reserve this much extra GPU memory in decimal GB after model setup to induce memory pressure")
+    parser.add_argument(
+        "--ft_host_alloc",
+        type=float,
+        default=0.0,
+        help="target percent of the feature matrix that should not fit in the remaining effective GPU memory",
+    )
     args = parser.parse_args()
     base_dim = int(args.dim)
     if args.feat_dim is None:
@@ -294,7 +299,12 @@ def run_gcn_inference(
     window_num_blocks = 1
     optimized_hmm_active = False
     reorder_enabled = False
-    reserve_device_bytes = max(0, int(float(args.reserve_device_gb) * 1_000_000_000.0))
+    ft_host_alloc = float(args.ft_host_alloc)
+    if ft_host_alloc < 0.0 or ft_host_alloc >= 100.0:
+        raise ValueError("--ft_host_alloc expects a value in [0, 100)")
+    reserve_device_bytes = 0
+    target_gpu_feature_bytes = 0
+    feature_bytes = 0
     reserve_tensor = None
 
     with phase_summary.measure("graph_prep", use_cuda_events=False):
@@ -429,9 +439,25 @@ def run_gcn_inference(
             else:
                 spmm_kernel = f"optimized_{ft_memory_mode}"
 
-    if reserve_device_bytes > 0:
+    feature_bytes = int(features.numel() * features.element_size())
+    feature_addr_start = int(features.data_ptr())
+    feature_addr_end = feature_addr_start + feature_bytes
+
+    if ft_host_alloc > 0.0:
         if device.type != "cuda":
-            raise ValueError("--reserve_device_gb requires a CUDA device")
+            raise ValueError("--ft_host_alloc requires a CUDA device")
+        if ft_memory_mode == "device":
+            raise ValueError("--ft_host_alloc is only meaningful with --ft_matrix uvm|hmm")
+        torch.cuda.synchronize(device)
+        gpu_fit_fraction = max(0.0, (100.0 - ft_host_alloc) / 100.0)
+        target_gpu_feature_bytes = int(feature_bytes * gpu_fit_fraction)
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+        reserve_device_bytes = max(0, int(free_bytes) - target_gpu_feature_bytes)
+
+    def activate_spmm_reserve() -> None:
+        nonlocal reserve_tensor
+        if reserve_device_bytes <= 0 or reserve_tensor is not None:
+            return
         try:
             reserve_tensor = torch.empty((reserve_device_bytes,), dtype=torch.uint8, device=device)
         except RuntimeError as exc:
@@ -441,15 +467,23 @@ def run_gcn_inference(
             ) from exc
         torch.cuda.synchronize(device)
 
+    def release_spmm_reserve() -> None:
+        nonlocal reserve_tensor
+        if reserve_tensor is None:
+            return
+        reserve_tensor = None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
+
     def forward_once() -> torch.Tensor:
-        x = features
-        for idx, layer in enumerate(layer_states):
-            tag = f"layer{idx + 1}"
-            layer_spmm_mode = spmm_mode
-            if idx == 0 and optimized_hmm_active:
-                layer_spmm_mode = "optimized"
-            elif idx != 0 and layer_spmm_mode == "optimized":
-                layer_spmm_mode = "plain"
+        def run_aggregation(
+            layer: LayerState,
+            idx: int,
+            tag: str,
+            layer_spmm_mode: str,
+            x: torch.Tensor,
+        ) -> None:
             with _nvtx_range(nvtx_enabled, f"{tag}/aggregation"):
                 with phase_summary.measure("spmm"):
                     if gcn_kernel_impl == "pyg_baseline":
@@ -477,6 +511,23 @@ def run_gcn_inference(
                             hot_feature_cache=hot_feature_cache if idx == 0 else None,
                             hot_node_cutoff=hot_node_cutoff if idx == 0 else 0,
                         )
+
+        x = features
+        for idx, layer in enumerate(layer_states):
+            tag = f"layer{idx + 1}"
+            layer_spmm_mode = spmm_mode
+            if idx == 0 and optimized_hmm_active:
+                layer_spmm_mode = "optimized"
+            elif idx != 0 and layer_spmm_mode == "optimized":
+                layer_spmm_mode = "plain"
+            if idx == 0:
+                activate_spmm_reserve()
+                try:
+                    run_aggregation(layer, idx, tag, layer_spmm_mode, x)
+                finally:
+                    release_spmm_reserve()
+            else:
+                run_aggregation(layer, idx, tag, layer_spmm_mode, x)
             with _nvtx_range(nvtx_enabled, f"{tag}/dense_update"):
                 with phase_summary.measure("gemm"):
                     gemm_forward_(
@@ -525,7 +576,12 @@ def run_gcn_inference(
     print(f"GCN Kernel Impl:\t{gcn_kernel_impl}")
     print(f"SpMM Mode:\t{spmm_mode}")
     print(f"Pre-touch Passes:\t{int(args.pretouch_passes)}")
-    print(f"Reserved Device Memory (GB):\t{float(args.reserve_device_gb):.3f}")
+    print(f"Feature Host Alloc Target (%):\t{ft_host_alloc:.3f}")
+    print(f"Feature Bytes:\t{feature_bytes}")
+    print(f"Feature Address Start:\t{feature_addr_start}")
+    print(f"Feature Address End:\t{feature_addr_end}")
+    print(f"Target GPU Feature Bytes:\t{target_gpu_feature_bytes}")
+    print(f"Reserved Device Memory (GB):\t{reserve_device_bytes / 1_000_000_000.0:.3f}")
     print(f"SpMM Kernel:\t{spmm_kernel}")
     print(f"Preprocess Meta:\t{preprocess_meta_path or 'none'}")
     print(f"Node Reorder:\t{reorder_enabled}")

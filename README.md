@@ -49,6 +49,15 @@ Use the nsys wrapper below to print average SpMM time and UM migration metrics d
 ```bash
 python run/profile_spmm_migration.py \
   --dataset Pubmed \
+  --ft_matrix uvm \
+  --ft_host_alloc 20
+```
+
+Sweep `ft_host_alloc=20,40,60,80`:
+
+```bash
+python run/sweep_ft_host_alloc.py \
+  --dataset Pubmed \
   --ft_matrix uvm
 ```
 
@@ -62,12 +71,14 @@ DtoH_bytes, ...
 GPU_faults, ...
 ```
 
-All reported UM metrics are averaged per measured iteration over NVTX `aggregation` ranges.
+All reported UM metrics are filtered to the feature matrix virtual-address range. For `--ft_matrix hmm`, migration metrics use the NVTX `aggregation` range. For `--ft_matrix uvm`, migration metrics use the full measured `iteration` range.
+This wrapper passes `--prefetch_to none --preferred_location none` to the target inference command.
 
 ## Arguments
 
 - `--dataset`: dataset name, required
 - `--ft_matrix`: feature placement, `device`, `uvm`, or `hmm`, required
+- `--ft_host_alloc`: target percent of the feature matrix that should not fit in remaining effective GPU memory, default `0`
 - `--framework`: `pyg` or `dgl`, default `pyg`
 - `--model`: `gcn`, `gin`, or `sag`, default `gcn`
 - `--dim`: base feature / hidden / output dimension, default `128`

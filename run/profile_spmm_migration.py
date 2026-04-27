@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import os
+import re
 import sqlite3
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +35,16 @@ class TimeRange:
 
 
 @dataclass(frozen=True)
+class AddressRange:
+    start: int
+    end: int
+
+    @property
+    def is_valid(self) -> bool:
+        return self.start >= 0 and self.end > self.start
+
+
+@dataclass(frozen=True)
 class UmTotals:
     htod_bytes: float = 0.0
     dtoh_bytes: float = 0.0
@@ -49,8 +58,26 @@ class UmTotals:
         )
 
 
+@dataclass(frozen=True)
+class NvtxRanges:
+    iterations: list[TimeRange]
+    aggregations: list[TimeRange]
+
+
+@dataclass(frozen=True)
+class Summary:
+    spmm_ns: float
+    um_totals: UmTotals
+
+
 def _run(cmd: list[str], *, stdout_path: Path | None = None, stderr_path: Path | None = None) -> None:
     kwargs = {"check": True, "text": True}
+    env = os.environ.copy()
+    python_paths = [str(REPO_ROOT.parent), str(REPO_ROOT), str(REPO_ROOT.parent / "GNN_models")]
+    if env.get("PYTHONPATH"):
+        python_paths.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    kwargs["env"] = env
     if stdout_path is not None:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         kwargs["stdout"] = stdout_path.open("w", encoding="utf-8")
@@ -87,10 +114,20 @@ def _inference_script(framework: str, model: str) -> Path:
     return script_path
 
 
-def _artifact_base(output_dir: Path, framework: str, model: str, dataset: str) -> Path:
+def _artifact_base(
+    output_dir: Path,
+    framework: str,
+    model: str,
+    dataset: str,
+    dim: int,
+    ft_matrix: str,
+    ft_host_alloc: float,
+) -> Path:
     dataset_token = dataset.replace("/", "_")
     model_token = _normalize_model(model)
-    return output_dir / f"{framework}_{model_token}_{dataset_token}_spmm_um"
+    dim_token = f"dim{int(dim)}"
+    host_token = f"host{ft_host_alloc:g}".replace(".", "p")
+    return output_dir / f"{framework}_{model_token}_{dataset_token}_{dim_token}_{ft_matrix}_{host_token}_spmm_um"
 
 
 def _build_profiled_cmd(args: argparse.Namespace) -> list[str]:
@@ -125,7 +162,13 @@ def _build_profiled_cmd(args: argparse.Namespace) -> list[str]:
         "--device",
         args.device,
         "--nvtx",
+        "--preferred_location",
+        "none",
+        "--prefetch_to",
+        "none",
     ]
+    if float(args.ft_host_alloc) > 0.0:
+        cmd += ["--ft_host_alloc", str(args.ft_host_alloc)]
     extra_args = list(args.extra_args or [])
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
@@ -164,7 +207,7 @@ def _export_sqlite(rep_path: Path, sqlite_base: Path) -> Path:
     )
 
 
-def _fetch_nvtx_ranges(sqlite_path: Path) -> tuple[list[TimeRange], list[TimeRange]]:
+def _fetch_nvtx_ranges(sqlite_path: Path) -> NvtxRanges:
     conn = sqlite3.connect(str(sqlite_path))
     try:
         table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -198,7 +241,10 @@ def _fetch_nvtx_ranges(sqlite_path: Path) -> tuple[list[TimeRange], list[TimeRan
                 iteration_ranges.append(time_range)
             elif range_name.endswith("/aggregation"):
                 aggregation_ranges.append(time_range)
-        return iteration_ranges, aggregation_ranges
+        return NvtxRanges(
+            iterations=iteration_ranges,
+            aggregations=aggregation_ranges,
+        )
     finally:
         conn.close()
 
@@ -207,56 +253,100 @@ def _overlaps(left: TimeRange, right: TimeRange) -> bool:
     return left.start_ns < right.end_ns and left.end_ns > right.start_ns
 
 
-def _csv_rows_from_stats(text: str, required_cols: tuple[str, ...]) -> list[dict[str, str]]:
-    lines = text.splitlines()
-    header_idx = None
-    for idx, line in enumerate(lines):
-        if all(col in line for col in required_cols):
-            header_idx = idx
-            break
-    if header_idx is None:
-        return []
-    return list(csv.DictReader(lines[header_idx:]))
+def _parse_feature_address_range(stdout_path: Path) -> AddressRange | None:
+    if not stdout_path.exists():
+        return None
+    start_addr = None
+    end_addr = None
+    pattern = re.compile(r"^Feature Address (Start|End):\s*(\d+)\s*$")
+    for line in stdout_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.match(line.strip())
+        if match is None:
+            continue
+        if match.group(1) == "Start":
+            start_addr = int(match.group(2))
+        else:
+            end_addr = int(match.group(2))
+    if start_addr is None or end_addr is None:
+        return None
+    feature_range = AddressRange(start=start_addr, end=end_addr)
+    return feature_range if feature_range.is_valid else None
 
 
-def _to_float(value: str) -> float:
-    cleaned = str(value or "").strip().replace(",", "")
-    return float(cleaned) if cleaned else 0.0
+def _um_total_stats(sqlite_path: Path, time_range: TimeRange, feature_range: AddressRange) -> UmTotals:
+    direct_totals = _um_total_stats_from_sqlite(sqlite_path, time_range, feature_range)
+    if direct_totals is not None:
+        return direct_totals
+    return UmTotals()
 
 
-def _um_total_stats(sqlite_path: Path, time_range: TimeRange) -> UmTotals:
-    cmd = [
-        "nsys",
-        "stats",
-        "--report",
-        "um_total_sum",
-        "--format",
-        "csv",
-        "--filter-time",
-        f"{time_range.start_ns}/{time_range.end_ns}",
-        str(sqlite_path),
-    ]
+def _um_total_stats_from_sqlite(
+    sqlite_path: Path,
+    time_range: TimeRange,
+    feature_range: AddressRange,
+) -> UmTotals | None:
+    conn = sqlite3.connect(str(sqlite_path))
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError:
-        return UmTotals()
+        table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "CUPTI_ACTIVITY_KIND_MEMCPY" not in table_names:
+            return None
 
-    rows = _csv_rows_from_stats(
-        result.stdout,
-        ("Total HtoD Migration Size", "Total DtoH Migration Size", "Total GPU Page Faults"),
-    )
-    if not rows:
-        return UmTotals()
-    row = rows[0]
-    return UmTotals(
-        htod_bytes=_to_float(row.get("Total HtoD Migration Size", "0")),
-        dtoh_bytes=_to_float(row.get("Total DtoH Migration Size", "0")),
-        gpu_faults=_to_float(row.get("Total GPU Page Faults", "0")),
-    )
+        htod_bytes = 0.0
+        dtoh_bytes = 0.0
+        for copy_kind, total_bytes in conn.execute(
+            """
+            SELECT copyKind, COALESCE(SUM(bytes), 0)
+            FROM CUPTI_ACTIVITY_KIND_MEMCPY
+            WHERE migrationCause IS NOT NULL
+              AND start < ?
+              AND end > ?
+              AND virtualAddress IS NOT NULL
+              AND virtualAddress < ?
+              AND (virtualAddress + bytes) > ?
+              AND copyKind IN (11, 12)
+            GROUP BY copyKind
+            """,
+            (
+                int(time_range.end_ns),
+                int(time_range.start_ns),
+                int(feature_range.end),
+                int(feature_range.start),
+            ),
+        ):
+            if int(copy_kind) == 11:
+                htod_bytes = float(total_bytes or 0)
+            elif int(copy_kind) == 12:
+                dtoh_bytes = float(total_bytes or 0)
+
+        gpu_faults = 0.0
+        if "CUDA_UM_GPU_PAGE_FAULT_EVENTS" in table_names:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(numberOfPageFaults), 0)
+                FROM CUDA_UM_GPU_PAGE_FAULT_EVENTS
+                WHERE start < ?
+                  AND end > ?
+                  AND address >= ?
+                  AND address < ?
+                """,
+                (
+                    int(time_range.end_ns),
+                    int(time_range.start_ns),
+                    int(feature_range.start),
+                    int(feature_range.end),
+                ),
+            ).fetchone()
+            gpu_faults = float(row[0] or 0)
+
+        return UmTotals(htod_bytes=htod_bytes, dtoh_bytes=dtoh_bytes, gpu_faults=gpu_faults)
+    finally:
+        conn.close()
 
 
-def _summarize(sqlite_path: Path) -> tuple[float, UmTotals]:
-    iteration_ranges, aggregation_ranges = _fetch_nvtx_ranges(sqlite_path)
+def _summarize(sqlite_path: Path, feature_range: AddressRange, *, ft_matrix: str) -> Summary:
+    nvtx_ranges = _fetch_nvtx_ranges(sqlite_path)
+    aggregation_ranges = nvtx_ranges.aggregations
+    iteration_ranges = nvtx_ranges.iterations
     if not aggregation_ranges:
         raise RuntimeError("no NVTX aggregation ranges found; make sure the target command ran with --nvtx")
 
@@ -270,9 +360,12 @@ def _summarize(sqlite_path: Path) -> tuple[float, UmTotals]:
         if not matching_aggs:
             continue
         iter_spmm_ns = float(sum(agg.duration_ns for agg in matching_aggs))
-        iter_um_totals = UmTotals()
-        for agg in matching_aggs:
-            iter_um_totals = iter_um_totals + _um_total_stats(sqlite_path, agg)
+        if ft_matrix == "hmm":
+            iter_um_totals = UmTotals()
+            for agg in matching_aggs:
+                iter_um_totals = iter_um_totals + _um_total_stats(sqlite_path, agg, feature_range)
+        else:
+            iter_um_totals = _um_total_stats(sqlite_path, iteration, feature_range)
         per_iter_spmm_ns.append(iter_spmm_ns)
         per_iter_um_totals.append(iter_um_totals)
 
@@ -285,17 +378,17 @@ def _summarize(sqlite_path: Path) -> tuple[float, UmTotals]:
         dtoh_bytes=sum(item.dtoh_bytes for item in per_iter_um_totals) / float(len(per_iter_um_totals)),
         gpu_faults=sum(item.gpu_faults for item in per_iter_um_totals) / float(len(per_iter_um_totals)),
     )
-    return avg_spmm_ns, avg_um_totals
+    return Summary(spmm_ns=avg_spmm_ns, um_totals=avg_um_totals)
 
 
-def _write_summary(path: Path, spmm_ns: float, um_totals: UmTotals) -> None:
+def _write_summary(path: Path, summary: Summary) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "Summary Report:\n"
-        f"spmm_ns, {spmm_ns:.3f}\n"
-        f"HtoD_bytes, {um_totals.htod_bytes:.3f}\n"
-        f"DtoH_bytes, {um_totals.dtoh_bytes:.3f}\n"
-        f"GPU_faults, {um_totals.gpu_faults:.3f}\n",
+        f"spmm_ns, {summary.spmm_ns:.3f}\n"
+        f"HtoD_bytes, {summary.um_totals.htod_bytes:.3f}\n"
+        f"DtoH_bytes, {summary.um_totals.dtoh_bytes:.3f}\n"
+        f"GPU_faults, {summary.um_totals.gpu_faults:.3f}\n",
         encoding="utf-8",
     )
 
@@ -312,6 +405,12 @@ def main() -> int:
     parser.add_argument("--num_layers", type=int, default=1, help="number of layers")
     parser.add_argument("--adj_matrix", type=str, default="device", choices=("device", "uvm", "hmm"), help="adjacency memory mode")
     parser.add_argument("--ft_matrix", type=str, required=True, choices=("device", "uvm", "hmm"), help="feature memory mode")
+    parser.add_argument(
+        "--ft_host_alloc",
+        type=float,
+        default=0.0,
+        help="target percent of the feature matrix that should not fit in remaining effective GPU memory",
+    )
     parser.add_argument("--weight", type=str, default="device", choices=("device", "uvm"), help="weight/output memory mode")
     parser.add_argument("--warmup", type=int, default=1, help="warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="measured iterations")
@@ -329,13 +428,25 @@ def main() -> int:
         help="extra inference args passed after `--`",
     )
     args = parser.parse_args()
+    if args.ft_host_alloc < 0.0 or args.ft_host_alloc >= 100.0:
+        raise ValueError("--ft_host_alloc expects a value in [0, 100)")
+    if args.ft_host_alloc > 0.0 and args.model != "gcn":
+        raise ValueError("--ft_host_alloc is currently implemented for --model gcn")
 
     _check_tool("nsys")
     _check_tool("conda")
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    artifact_base = _artifact_base(output_dir, args.framework, args.model, args.dataset)
+    artifact_base = _artifact_base(
+        output_dir,
+        args.framework,
+        args.model,
+        args.dataset,
+        int(args.dim),
+        args.ft_matrix,
+        args.ft_host_alloc,
+    )
     rep_path = artifact_base.with_suffix(".nsys-rep")
     sqlite_base = artifact_base.with_name(f"{artifact_base.name}_sqlite")
     sqlite_path = sqlite_base.with_suffix(".sqlite")
@@ -351,6 +462,7 @@ def main() -> int:
         "cuda,nvtx",
         "--sample",
         "none",
+        "--cuda-memory-usage=true",
         "--cuda-um-cpu-page-faults=true",
         "--cuda-um-gpu-page-faults=true",
         "--force-overwrite",
@@ -364,14 +476,20 @@ def main() -> int:
         raise FileNotFoundError(f"expected nsys report not found: {rep_path}")
 
     sqlite_path = _export_sqlite(rep_path, sqlite_base)
-    avg_spmm_ns, avg_um_totals = _summarize(sqlite_path)
-    _write_summary(summary_path, avg_spmm_ns, avg_um_totals)
+    feature_range = _parse_feature_address_range(target_stdout)
+    if feature_range is None:
+        raise RuntimeError(
+            f"feature address range not found in target output: {target_stdout}; "
+            "rebuild/run the target after the feature-address logging patch"
+        )
+    summary = _summarize(sqlite_path, feature_range, ft_matrix=args.ft_matrix)
+    _write_summary(summary_path, summary)
 
     print("Summary Report:")
-    print(f"spmm_ns, {avg_spmm_ns:.3f}")
-    print(f"HtoD_bytes, {avg_um_totals.htod_bytes:.3f}")
-    print(f"DtoH_bytes, {avg_um_totals.dtoh_bytes:.3f}")
-    print(f"GPU_faults, {avg_um_totals.gpu_faults:.3f}")
+    print(f"spmm_ns, {summary.spmm_ns:.3f}")
+    print(f"HtoD_bytes, {summary.um_totals.htod_bytes:.3f}")
+    print(f"DtoH_bytes, {summary.um_totals.dtoh_bytes:.3f}")
+    print(f"GPU_faults, {summary.um_totals.gpu_faults:.3f}")
     return 0
 
 
