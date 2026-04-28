@@ -73,7 +73,7 @@ class Summary:
 def _run(cmd: list[str], *, stdout_path: Path | None = None, stderr_path: Path | None = None) -> None:
     kwargs = {"check": True, "text": True}
     env = os.environ.copy()
-    python_paths = [str(REPO_ROOT.parent), str(REPO_ROOT), str(REPO_ROOT.parent / "GNN_models")]
+    python_paths = [str(REPO_ROOT.parent), str(REPO_ROOT)]
     if env.get("PYTHONPATH"):
         python_paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(python_paths)

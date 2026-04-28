@@ -16,20 +16,18 @@ _gnn_cuda_setup_vars() {
     local dataset_path="${1:-${GNN_DATASET_ROOT:-/root/workspace/mnt/dataset_npz}}"
     export WORKSPACE_ROOT="$(_gnn_cuda_workspace_root)"
     export GNN_CUDA_ROOT="$(_gnn_cuda_script_dir)"
-    export GNN_MODELS_ROOT="${WORKSPACE_ROOT}/GNN_models"
     export GNN_DATASET_ROOT="${dataset_path}"
     export GNN_ENV_DIR="${GNN_CUDA_ROOT}/env"
     export GNN_PYG_ENV_FILE="${GNN_ENV_DIR}/cu128_pyg.yml"
     export GNN_DGL_ENV_FILE="${GNN_ENV_DIR}/cu128_dgl.yml"
     export GNN_PYG_ENV="${GNN_PYG_ENV:-cu128_pyg}"
     export GNN_DGL_ENV="${GNN_DGL_ENV:-cu128_dgl}"
-    export PYTHONPATH="${WORKSPACE_ROOT}:${GNN_MODELS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    export PYTHONPATH="${WORKSPACE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 }
 
 gnn_cuda_show_environment() {
     echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}"
     echo "GNN_CUDA_ROOT=${GNN_CUDA_ROOT}"
-    echo "GNN_MODELS_ROOT=${GNN_MODELS_ROOT}"
     echo "GNN_DATASET_ROOT=${GNN_DATASET_ROOT}"
     echo "GNN_ENV_DIR=${GNN_ENV_DIR}"
     echo "GNN_PYG_ENV=${GNN_PYG_ENV}"
@@ -61,7 +59,7 @@ _gnn_cuda_build_one_env() {
 import os
 import sys
 
-for env_key in ("WORKSPACE_ROOT", "GNN_MODELS_ROOT"):
+for env_key in ("WORKSPACE_ROOT",):
     path = os.environ.get(env_key)
     if path and path not in sys.path:
         sys.path.insert(0, path)

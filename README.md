@@ -53,14 +53,6 @@ python run/profile_spmm_migration.py \
   --ft_host_alloc 20
 ```
 
-Sweep `ft_host_alloc=20,40,60,80`:
-
-```bash
-python run/sweep_ft_host_alloc.py \
-  --dataset Pubmed \
-  --ft_matrix uvm
-```
-
 Output:
 
 ```text
@@ -71,8 +63,8 @@ DtoH_bytes, ...
 GPU_faults, ...
 ```
 
-All reported UM metrics are filtered to the feature matrix virtual-address range. For `--ft_matrix hmm`, migration metrics use the NVTX `aggregation` range. For `--ft_matrix uvm`, migration metrics use the full measured `iteration` range.
-This wrapper passes `--prefetch_to none --preferred_location none` to the target inference command.
+<!-- All reported UM metrics are filtered to the feature matrix virtual-address range. For `--ft_matrix hmm`, migration metrics use the NVTX `aggregation` range. For `--ft_matrix uvm`, migration metrics use the full measured `iteration` range.
+This wrapper passes `--prefetch_to none --preferred_location none` to the target inference command. -->
 
 ## Arguments
 
