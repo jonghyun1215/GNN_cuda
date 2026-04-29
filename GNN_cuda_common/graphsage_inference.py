@@ -20,6 +20,7 @@ from .allocator import (
     allocate_empty,
     allocate_like_mode,
     apply_managed_policy,
+    is_uvm_mode,
     normalize_memory_mode,
     pointer_info,
     prefers_hmm_spmm,
@@ -90,6 +91,7 @@ def _apply_policy_if_needed(
     managed_cfg: ManagedAllocationConfig,
     device: torch.device,
     read_mostly: bool,
+    prefetch: bool = True,
 ) -> None:
     if not uses_cuda_memory_hints(memory_mode):
         return
@@ -101,7 +103,8 @@ def _apply_policy_if_needed(
         accessed_by_cuda=managed_cfg.accessed_by_cuda,
         read_mostly=read_mostly,
     )
-    prefetch_managed(tensor, location=managed_cfg.prefetch_to, device=device)
+    if prefetch:
+        prefetch_managed(tensor, location=managed_cfg.prefetch_to, device=device)
 
 
 @dataclass
@@ -193,11 +196,11 @@ def run_graphsage_inference(
     parser.add_argument("--ft_matrix", type=str, default=None, help="feature backend for node feature tensors: device, uvm, hmm")
     parser.add_argument("--weight", type=str, default=None, help="compute backend for weights/outputs/scratch: device or uvm")
     parser.add_argument("--compute_memory_mode", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--preferred_location", type=str, default="cuda", choices=["none", "cpu", "cuda"], help="UVM preferred location hint")
+    parser.add_argument("--preferred_location", type=str, default="none", choices=["none", "cpu", "cuda"], help="UVM preferred location hint")
     parser.add_argument("--accessed_by_cpu", action="store_true", help="mark UVM tensors as CPU-accessible")
     parser.add_argument("--accessed_by_cuda", action="store_true", help="mark UVM tensors as GPU-accessible")
     parser.add_argument("--read_mostly_graph", action="store_true", help="mark graph structures as read-mostly")
-    parser.add_argument("--prefetch_to", type=str, default="cuda", choices=["none", "cpu", "cuda"], help="prefetch UVM tensors before compute")
+    parser.add_argument("--prefetch_to", type=str, default="none", choices=["none", "cpu", "cuda"], help="prefetch UVM tensors before compute")
     parser.add_argument("--amp", action="store_true", help="reserved; CUDA prototype currently runs fp32")
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True, help="allow TF32 Tensor Core path for float32 GEMM on CUDA")
     parser.add_argument("--nvtx", action="store_true", help="enable NVTX ranges for profiling")
@@ -233,6 +236,7 @@ def run_graphsage_inference(
     args.ft_matrix = ft_memory_mode
     args.weight = weight_memory_mode
     print(args)
+    feature_initial_location = "cpu" if is_uvm_mode(ft_memory_mode) else "none"
     if "hmm" in (adj_memory_mode, ft_memory_mode) and device.type != "cuda":
         raise ValueError(
             f"adj_matrix/ft_matrix expect one of {GRAPH_MEMORY_MODES} on CUDA; 'hmm' requires a CUDA device"
@@ -262,7 +266,12 @@ def run_graphsage_inference(
 
         row_ptr = allocate_like_mode(csr.row_ptr, memory_mode=adj_memory_mode, device=device)
         col_ind = allocate_like_mode(csr.col_ind, memory_mode=adj_memory_mode, device=device)
-        features = allocate_like_mode(features_cpu, memory_mode=ft_memory_mode, device=device)
+        features = allocate_like_mode(
+            features_cpu,
+            memory_mode=ft_memory_mode,
+            device=device,
+            uvm_initial_location=feature_initial_location,
+        )
         for tensor in (row_ptr, col_ind):
             _apply_policy_if_needed(
                 tensor,
@@ -277,7 +286,14 @@ def run_graphsage_inference(
             managed_cfg=managed_cfg,
             device=device,
             read_mostly=False,
+            prefetch=False,
         )
+        if uses_cuda_memory_hints(ft_memory_mode):
+            if feature_initial_location != "none":
+                prefetch_managed(features, location=feature_initial_location, device=device)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            prefetch_managed(features, location=managed_cfg.prefetch_to, device=device)
 
         layer_states = [
             _make_layer_state(
@@ -361,6 +377,8 @@ def run_graphsage_inference(
     print(f"Impl:\t{framework_label}_graphsage_cuda")
     print(f"Adjacency Memory Mode:\t{adj_memory_mode}")
     print(f"Feature Memory Mode:\t{ft_memory_mode}")
+    print(f"Feature Initial Location:\t{feature_initial_location}")
+    print(f"Feature Prefetch To:\t{managed_cfg.prefetch_to}")
     print(f"Weight Memory Mode:\t{weight_memory_mode}")
     print(f"SpMM Kernel:\t{spmm_kernel}")
     print(f"Nodes:\t{num_nodes}")

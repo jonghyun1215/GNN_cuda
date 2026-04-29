@@ -38,6 +38,10 @@ from .pyg_gcn_ops import spmm_pyg_gcn_forward_
 from .phase_summary import PhaseSummary, print_summary_report
 
 
+PARTIAL_PREFETCH_FRACTION = 0.80
+MIN_PARTIAL_PREFETCH_RUNTIME_SLACK_BYTES = 128 * 1024 * 1024
+
+
 def _autocast_context(use_amp: bool, device: torch.device):
     if use_amp and device.type == "cuda":
         return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
@@ -209,11 +213,11 @@ def run_gcn_inference(
     parser.add_argument("--hmm_mode", type=str, default="plain", choices=["plain", "optimized"], help=argparse.SUPPRESS)
     parser.add_argument("--preprocess_meta", type=str, default="none", help=argparse.SUPPRESS)
     parser.add_argument("--pretouch_passes", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--preferred_location", type=str, default="cuda", choices=["none", "cpu", "cuda"], help="UVM preferred location hint")
+    parser.add_argument("--preferred_location", type=str, default="none", choices=["none", "cpu", "cuda"], help="UVM preferred location hint")
     parser.add_argument("--accessed_by_cpu", action="store_true", help="mark UVM tensors as CPU-accessible")
     parser.add_argument("--accessed_by_cuda", action="store_true", help="mark UVM tensors as GPU-accessible")
     parser.add_argument("--read_mostly_graph", action="store_true", help="mark graph structures as read-mostly")
-    parser.add_argument("--prefetch_to", type=str, default="cuda", choices=["none", "cpu", "cuda"], help="prefetch UVM tensors before compute")
+    parser.add_argument("--prefetch_to", type=str, default="none", choices=["none", "cpu", "cuda"], help="prefetch UVM tensors before compute")
     parser.add_argument("--amp", action="store_true", help="reserved; CUDA prototype currently runs fp32")
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True, help="allow TF32 Tensor Core path for float32 GEMM on CUDA")
     parser.add_argument("--nvtx", action="store_true", help="enable NVTX ranges for profiling")
@@ -302,10 +306,48 @@ def run_gcn_inference(
     ft_host_alloc = float(args.ft_host_alloc)
     if ft_host_alloc < 0.0 or ft_host_alloc >= 100.0:
         raise ValueError("--ft_host_alloc expects a value in [0, 100)")
+    ft_reserve_enabled = ft_host_alloc > 0.0
+    feature_initial_location = "cpu" if is_uvm_mode(ft_memory_mode) else "none"
+    if ft_reserve_enabled:
+        if device.type != "cuda":
+            raise ValueError("--ft_host_alloc requires a CUDA device")
+        if ft_memory_mode == "device":
+            raise ValueError("--ft_host_alloc is only meaningful with --ft_matrix uvm|hmm")
     reserve_device_bytes = 0
     target_gpu_feature_bytes = 0
     feature_bytes = 0
+    reserve_free_bytes_before = 0
+    reserve_free_bytes_after = 0
     reserve_tensor = None
+    reserve_activated_bytes = 0
+    reserve_activations = 0
+    feature_cuda_prefetch_bytes = 0
+
+    def activate_feature_reserve() -> None:
+        nonlocal reserve_tensor, reserve_activated_bytes, reserve_activations, reserve_free_bytes_after
+        if reserve_device_bytes <= 0 or reserve_tensor is not None:
+            return
+        try:
+            reserve_tensor = torch.empty((reserve_device_bytes,), dtype=torch.uint8, device=device)
+        except RuntimeError as exc:
+            gib = reserve_device_bytes / float(1024 ** 3)
+            raise RuntimeError(
+                f"Failed to reserve {reserve_device_bytes} bytes ({gib:.3f} GiB) of extra device memory"
+            ) from exc
+        reserve_activated_bytes = int(reserve_tensor.numel())
+        reserve_activations += 1
+        torch.cuda.synchronize(device)
+        free_after, _ = torch.cuda.mem_get_info(device)
+        reserve_free_bytes_after = int(free_after)
+
+    def release_feature_reserve() -> None:
+        nonlocal reserve_tensor
+        if reserve_tensor is None:
+            return
+        reserve_tensor = None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
 
     with phase_summary.measure("graph_prep", use_cuda_events=False):
         graph_path = resolve_dataset_path(str(args.dataset), data_root=str(args.data_root))
@@ -369,6 +411,7 @@ def run_gcn_inference(
         if spmm_mode == "optimized" and gcn_kernel_impl not in {"legacy_fused", "pyg_baseline"}:
             raise ValueError("--spmm_mode optimized expects legacy_fused or pyg_baseline")
         features_cpu = features_cpu.contiguous().to(dtype=torch.float32)
+        feature_bytes = int(features_cpu.numel() * features_cpu.element_size())
         if gcn_kernel_impl == "pyg_baseline":
             weighted_csr = build_pyg_gcn_weighted_csr(src, dst, num_nodes=num_nodes, add_self_loops=True)
             row_ptr = allocate_like_mode(weighted_csr.row_ptr, memory_mode=adj_memory_mode, device=device)
@@ -383,7 +426,6 @@ def run_gcn_inference(
             col_ind = allocate_like_mode(csr.col_ind, memory_mode=adj_memory_mode, device=device)
             deg_inv_sqrt = allocate_like_mode(csr.deg_inv_sqrt, memory_mode=adj_memory_mode, device=device)
             adj_tensors = (row_ptr, col_ind, deg_inv_sqrt)
-        features = allocate_like_mode(features_cpu, memory_mode=ft_memory_mode, device=device)
         if uses_cuda_memory_hints(adj_memory_mode):
             for tensor in adj_tensors:
                 apply_managed_policy(
@@ -395,29 +437,15 @@ def run_gcn_inference(
                     read_mostly=managed_cfg.read_mostly_graph,
                 )
                 prefetch_managed(tensor, location=managed_cfg.prefetch_to, device=device)
-        if uses_cuda_memory_hints(ft_memory_mode):
-            apply_managed_policy(
-                features,
-                device=device,
-                preferred_location=managed_cfg.preferred_location,
-                accessed_by_cpu=managed_cfg.accessed_by_cpu,
-                accessed_by_cuda=managed_cfg.accessed_by_cuda,
-                read_mostly=False,
-            )
-            prefetch_managed(features, location=managed_cfg.prefetch_to, device=device)
 
         if row_schedule_cpu is not None:
             row_schedule_device = row_schedule_cpu.to(device=device, dtype=torch.long, non_blocking=False)
 
         if row_schedule_device is not None and hot_node_cutoff > 0:
             hot_feature_cache = torch.empty(
-                (int(hot_node_cutoff), int(features.size(1))),
+                (int(hot_node_cutoff), int(features_cpu.size(1))),
                 dtype=torch.float32,
                 device=device,
-            )
-            stage_feature_rows_(
-                features,
-                hot_feature_cache,
             )
             optimized_hmm_active = True
 
@@ -431,50 +459,77 @@ def run_gcn_inference(
                 activation_memory_mode=activation_memory_mode,
                 managed_cfg=managed_cfg,
             )
-            for in_dim, out_dim in _build_layer_dims(int(features.size(1)), int(args.hidden_dim), int(args.out_dim), int(args.num_layers))
+            for in_dim, out_dim in _build_layer_dims(int(features_cpu.size(1)), int(args.hidden_dim), int(args.out_dim), int(args.num_layers))
         ]
+        if ft_reserve_enabled:
+            torch.cuda.synchronize(device)
+            gpu_fit_fraction = max(0.0, (100.0 - ft_host_alloc) / 100.0)
+            target_gpu_feature_bytes = int(feature_bytes * gpu_fit_fraction)
+            if managed_cfg.prefetch_to == "cuda":
+                if target_gpu_feature_bytes >= MIN_PARTIAL_PREFETCH_RUNTIME_SLACK_BYTES:
+                    feature_cuda_prefetch_bytes = int(target_gpu_feature_bytes * PARTIAL_PREFETCH_FRACTION)
+                    feature_cuda_prefetch_bytes = max(0, min(feature_cuda_prefetch_bytes, feature_bytes))
+                else:
+                    feature_cuda_prefetch_bytes = 0
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+            reserve_free_bytes_before = int(free_bytes)
+            reserve_device_bytes = max(
+                0,
+                int(free_bytes) - target_gpu_feature_bytes - feature_cuda_prefetch_bytes,
+            )
+            activate_feature_reserve()
+
+        features = allocate_like_mode(
+            features_cpu,
+            memory_mode=ft_memory_mode,
+            device=device,
+            uvm_initial_location=feature_initial_location,
+        )
+        if uses_cuda_memory_hints(ft_memory_mode):
+            feature_preferred_location = (
+                "cpu"
+                if ft_reserve_enabled and managed_cfg.prefetch_to == "cuda"
+                else managed_cfg.preferred_location
+            )
+            apply_managed_policy(
+                features,
+                device=device,
+                preferred_location=feature_preferred_location,
+                accessed_by_cpu=managed_cfg.accessed_by_cpu,
+                accessed_by_cuda=managed_cfg.accessed_by_cuda,
+                read_mostly=False,
+            )
+            if feature_initial_location != "none":
+                prefetch_managed(features, location=feature_initial_location, device=device)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            if managed_cfg.prefetch_to == "cuda":
+                if ft_reserve_enabled:
+                    prefetch_managed(
+                        features,
+                        location=managed_cfg.prefetch_to,
+                        device=device,
+                        nbytes=feature_cuda_prefetch_bytes,
+                    )
+                else:
+                    feature_cuda_prefetch_bytes = feature_bytes
+                    prefetch_managed(features, location=managed_cfg.prefetch_to, device=device)
+            else:
+                prefetch_managed(features, location=managed_cfg.prefetch_to, device=device)
+
+        if hot_feature_cache is not None:
+            stage_feature_rows_(
+                features,
+                hot_feature_cache,
+            )
         if optimized_hmm_active:
             if gcn_kernel_impl == "pyg_baseline":
                 spmm_kernel = f"optimized_pyg_{ft_memory_mode}"
             else:
                 spmm_kernel = f"optimized_{ft_memory_mode}"
 
-    feature_bytes = int(features.numel() * features.element_size())
     feature_addr_start = int(features.data_ptr())
     feature_addr_end = feature_addr_start + feature_bytes
-
-    if ft_host_alloc > 0.0:
-        if device.type != "cuda":
-            raise ValueError("--ft_host_alloc requires a CUDA device")
-        if ft_memory_mode == "device":
-            raise ValueError("--ft_host_alloc is only meaningful with --ft_matrix uvm|hmm")
-        torch.cuda.synchronize(device)
-        gpu_fit_fraction = max(0.0, (100.0 - ft_host_alloc) / 100.0)
-        target_gpu_feature_bytes = int(feature_bytes * gpu_fit_fraction)
-        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
-        reserve_device_bytes = max(0, int(free_bytes) - target_gpu_feature_bytes)
-
-    def activate_spmm_reserve() -> None:
-        nonlocal reserve_tensor
-        if reserve_device_bytes <= 0 or reserve_tensor is not None:
-            return
-        try:
-            reserve_tensor = torch.empty((reserve_device_bytes,), dtype=torch.uint8, device=device)
-        except RuntimeError as exc:
-            gib = reserve_device_bytes / float(1024 ** 3)
-            raise RuntimeError(
-                f"Failed to reserve {reserve_device_bytes} bytes ({gib:.3f} GiB) of extra device memory"
-            ) from exc
-        torch.cuda.synchronize(device)
-
-    def release_spmm_reserve() -> None:
-        nonlocal reserve_tensor
-        if reserve_tensor is None:
-            return
-        reserve_tensor = None
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(device)
 
     def forward_once() -> torch.Tensor:
         def run_aggregation(
@@ -521,11 +576,11 @@ def run_gcn_inference(
             elif idx != 0 and layer_spmm_mode == "optimized":
                 layer_spmm_mode = "plain"
             if idx == 0:
-                activate_spmm_reserve()
+                activate_feature_reserve()
                 try:
                     run_aggregation(layer, idx, tag, layer_spmm_mode, x)
                 finally:
-                    release_spmm_reserve()
+                    release_feature_reserve()
             else:
                 run_aggregation(layer, idx, tag, layer_spmm_mode, x)
             with _nvtx_range(nvtx_enabled, f"{tag}/dense_update"):
@@ -571,17 +626,26 @@ def run_gcn_inference(
     print(f"Impl:\t{framework_label}_gcn_cuda")
     print(f"Adjacency Memory Mode:\t{adj_memory_mode}")
     print(f"Feature Memory Mode:\t{ft_memory_mode}")
+    print(f"Feature Initial Location:\t{feature_initial_location}")
+    print(f"Feature Prefetch To:\t{managed_cfg.prefetch_to}")
+    print(f"Feature Preferred Location:\t{feature_preferred_location if uses_cuda_memory_hints(ft_memory_mode) else 'none'}")
     print(f"Weight Memory Mode:\t{weight_memory_mode}")
     print(f"Activation Memory Mode:\t{activation_memory_mode}")
     print(f"GCN Kernel Impl:\t{gcn_kernel_impl}")
     print(f"SpMM Mode:\t{spmm_mode}")
     print(f"Pre-touch Passes:\t{int(args.pretouch_passes)}")
     print(f"Feature Host Alloc Target (%):\t{ft_host_alloc:.3f}")
+    print(f"Feature Reserve Enabled:\t{ft_reserve_enabled}")
     print(f"Feature Bytes:\t{feature_bytes}")
+    print(f"Feature CUDA Prefetch Bytes:\t{feature_cuda_prefetch_bytes}")
     print(f"Feature Address Start:\t{feature_addr_start}")
     print(f"Feature Address End:\t{feature_addr_end}")
     print(f"Target GPU Feature Bytes:\t{target_gpu_feature_bytes}")
+    print(f"Reserve Free Memory Before (GB):\t{reserve_free_bytes_before / 1_000_000_000.0:.3f}")
+    print(f"Reserve Free Memory After (GB):\t{reserve_free_bytes_after / 1_000_000_000.0:.3f}")
     print(f"Reserved Device Memory (GB):\t{reserve_device_bytes / 1_000_000_000.0:.3f}")
+    print(f"Activated Reserved Device Memory (GB):\t{reserve_activated_bytes / 1_000_000_000.0:.3f}")
+    print(f"Reserve Activations:\t{reserve_activations}")
     print(f"SpMM Kernel:\t{spmm_kernel}")
     print(f"Preprocess Meta:\t{preprocess_meta_path or 'none'}")
     print(f"Node Reorder:\t{reorder_enabled}")

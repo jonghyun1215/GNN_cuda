@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("--num_layers", type=int, default=1, help="number of layers")
     parser.add_argument("--adj_matrix", default="device", choices=("device", "uvm", "hmm"), help="adjacency memory mode")
     parser.add_argument("--weight", default="device", choices=("device", "uvm"), help="weight/output memory mode")
+    parser.add_argument("--prefetch", type=int, default=0, choices=(0, 1), help="0 disables prefetch hints; 1 uses cuda")
     parser.add_argument("--warmup", type=int, default=1, help="warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="measured iterations")
     parser.add_argument("--device", default="cuda:0", help="CUDA device string")
@@ -63,6 +64,8 @@ def main() -> int:
             args.adj_matrix,
             "--weight",
             args.weight,
+            "--prefetch",
+            str(args.prefetch),
             "--warmup",
             str(args.warmup),
             "--iters",

@@ -109,11 +109,17 @@ def allocate_like_mode(
     *,
     memory_mode: str,
     device: torch.device,
+    uvm_initial_location: str = "cuda",
 ) -> torch.Tensor:
     memory_mode = normalize_memory_mode(memory_mode, allow_hmm=True)
     if memory_mode == "uvm":
         out = managed_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
-        out.copy_(cpu_tensor, non_blocking=False)
+        if uvm_initial_location == "cpu":
+            _allocator().copy_cpu_to_managed_(out, cpu_tensor.contiguous())
+        elif uvm_initial_location in ("cuda", "none"):
+            out.copy_(cpu_tensor, non_blocking=False)
+        else:
+            raise ValueError("uvm_initial_location expects 'cpu', 'cuda', or 'none'")
         return out
     if memory_mode == "hmm":
         out = hmm_empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device=device)
@@ -161,14 +167,24 @@ def apply_managed_policy(
         mod.advise_read_mostly_(tensor, True)
 
 
-def prefetch_managed(tensor: torch.Tensor, *, location: str, device: torch.device) -> None:
+def prefetch_managed(
+    tensor: torch.Tensor,
+    *,
+    location: str,
+    device: torch.device,
+    nbytes: int | None = None,
+) -> None:
     mod = _allocator()
     if location == "none":
         return
     target = LOCATION_TO_CODE[location]
     if target == 0:
         target = int(device.index or 0)
-    mod.prefetch_(tensor, target, int(device.index or 0))
+    if nbytes is None:
+        mod.prefetch_(tensor, target, int(device.index or 0))
+        return
+    byte_count = max(0, min(int(nbytes), int(tensor.numel() * tensor.element_size())))
+    mod.prefetch_range_(tensor, 0, byte_count, target, int(device.index or 0))
 
 
 def pointer_info(tensor: torch.Tensor) -> dict[str, object]:

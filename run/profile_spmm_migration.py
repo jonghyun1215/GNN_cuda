@@ -105,6 +105,14 @@ def _normalize_model(model: str) -> str:
     return key
 
 
+def _prefetch_to_location(prefetch: int) -> str:
+    if int(prefetch) == 0:
+        return "none"
+    if int(prefetch) == 1:
+        return "cuda"
+    raise ValueError("--prefetch expects 0 or 1")
+
+
 def _inference_script(framework: str, model: str) -> Path:
     model_dir = MODEL_DIRS[_normalize_model(model)]
     prefix = "GNN_PyG_cuda" if framework == "pyg" else "GNN_DGL_cuda"
@@ -122,12 +130,17 @@ def _artifact_base(
     dim: int,
     ft_matrix: str,
     ft_host_alloc: float,
+    prefetch_to: str,
 ) -> Path:
     dataset_token = dataset.replace("/", "_")
     model_token = _normalize_model(model)
     dim_token = f"dim{int(dim)}"
     host_token = f"host{ft_host_alloc:g}".replace(".", "p")
-    return output_dir / f"{framework}_{model_token}_{dataset_token}_{dim_token}_{ft_matrix}_{host_token}_spmm_um"
+    prefetch_token = f"prefetch{prefetch_to}"
+    return output_dir / (
+        f"{framework}_{model_token}_{dataset_token}_{dim_token}_{ft_matrix}_"
+        f"{host_token}_{prefetch_token}_spmm_um"
+    )
 
 
 def _build_profiled_cmd(args: argparse.Namespace) -> list[str]:
@@ -163,12 +176,12 @@ def _build_profiled_cmd(args: argparse.Namespace) -> list[str]:
         args.device,
         "--nvtx",
         "--preferred_location",
-        "none",
+        args.resolved_prefetch_location,
         "--prefetch_to",
-        "none",
+        args.resolved_prefetch_location,
+        "--ft_host_alloc",
+        str(args.ft_host_alloc),
     ]
-    if float(args.ft_host_alloc) > 0.0:
-        cmd += ["--ft_host_alloc", str(args.ft_host_alloc)]
     extra_args = list(args.extra_args or [])
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
@@ -280,6 +293,13 @@ def _um_total_stats(sqlite_path: Path, time_range: TimeRange, feature_range: Add
     return UmTotals()
 
 
+def _um_total_stats_all_time(sqlite_path: Path, feature_range: AddressRange) -> UmTotals:
+    direct_totals = _um_total_stats_all_time_from_sqlite(sqlite_path, feature_range)
+    if direct_totals is not None:
+        return direct_totals
+    return UmTotals()
+
+
 def _um_total_stats_from_sqlite(
     sqlite_path: Path,
     time_range: TimeRange,
@@ -343,6 +363,60 @@ def _um_total_stats_from_sqlite(
         conn.close()
 
 
+def _um_total_stats_all_time_from_sqlite(
+    sqlite_path: Path,
+    feature_range: AddressRange,
+) -> UmTotals | None:
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "CUPTI_ACTIVITY_KIND_MEMCPY" not in table_names:
+            return None
+
+        htod_bytes = 0.0
+        dtoh_bytes = 0.0
+        for copy_kind, total_bytes in conn.execute(
+            """
+            SELECT copyKind, COALESCE(SUM(bytes), 0)
+            FROM CUPTI_ACTIVITY_KIND_MEMCPY
+            WHERE migrationCause IS NOT NULL
+              AND virtualAddress IS NOT NULL
+              AND virtualAddress < ?
+              AND (virtualAddress + bytes) > ?
+              AND copyKind IN (11, 12)
+            GROUP BY copyKind
+            """,
+            (
+                int(feature_range.end),
+                int(feature_range.start),
+            ),
+        ):
+            if int(copy_kind) == 11:
+                htod_bytes = float(total_bytes or 0)
+            elif int(copy_kind) == 12:
+                dtoh_bytes = float(total_bytes or 0)
+
+        gpu_faults = 0.0
+        if "CUDA_UM_GPU_PAGE_FAULT_EVENTS" in table_names:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(numberOfPageFaults), 0)
+                FROM CUDA_UM_GPU_PAGE_FAULT_EVENTS
+                WHERE address >= ?
+                  AND address < ?
+                """,
+                (
+                    int(feature_range.start),
+                    int(feature_range.end),
+                ),
+            ).fetchone()
+            gpu_faults = float(row[0] or 0)
+
+        return UmTotals(htod_bytes=htod_bytes, dtoh_bytes=dtoh_bytes, gpu_faults=gpu_faults)
+    finally:
+        conn.close()
+
+
 def _summarize(sqlite_path: Path, feature_range: AddressRange, *, ft_matrix: str) -> Summary:
     nvtx_ranges = _fetch_nvtx_ranges(sqlite_path)
     aggregation_ranges = nvtx_ranges.aggregations
@@ -364,6 +438,12 @@ def _summarize(sqlite_path: Path, feature_range: AddressRange, *, ft_matrix: str
             iter_um_totals = UmTotals()
             for agg in matching_aggs:
                 iter_um_totals = iter_um_totals + _um_total_stats(sqlite_path, agg, feature_range)
+        elif ft_matrix == "uvm":
+            # UVM prefetch and first-touch migrations may occur before the
+            # measured iteration NVTX range. Keep SpMM timing tied to
+            # aggregation ranges, but count all feature-range UM events in the
+            # profile so prefetch-driven migration is not dropped.
+            iter_um_totals = _um_total_stats_all_time(sqlite_path, feature_range)
         else:
             iter_um_totals = _um_total_stats(sqlite_path, iteration, feature_range)
         per_iter_spmm_ns.append(iter_spmm_ns)
@@ -412,6 +492,7 @@ def main() -> int:
         help="target percent of the feature matrix that should not fit in remaining effective GPU memory",
     )
     parser.add_argument("--weight", type=str, default="device", choices=("device", "uvm"), help="weight/output memory mode")
+    parser.add_argument("--prefetch", type=int, default=0, choices=(0, 1), help="0 disables prefetch hints; 1 uses cuda")
     parser.add_argument("--warmup", type=int, default=1, help="warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="measured iterations")
     parser.add_argument("--device", type=str, default="cuda:0", help="CUDA device string")
@@ -432,6 +513,7 @@ def main() -> int:
         raise ValueError("--ft_host_alloc expects a value in [0, 100)")
     if args.ft_host_alloc > 0.0 and args.model != "gcn":
         raise ValueError("--ft_host_alloc is currently implemented for --model gcn")
+    args.resolved_prefetch_location = _prefetch_to_location(args.prefetch)
 
     _check_tool("nsys")
     _check_tool("conda")
@@ -446,6 +528,7 @@ def main() -> int:
         int(args.dim),
         args.ft_matrix,
         args.ft_host_alloc,
+        args.resolved_prefetch_location,
     )
     rep_path = artifact_base.with_suffix(".nsys-rep")
     sqlite_base = artifact_base.with_name(f"{artifact_base.name}_sqlite")

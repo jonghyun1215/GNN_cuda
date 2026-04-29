@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -125,6 +126,28 @@ torch::Tensor hmm_empty_cpu(std::vector<int64_t> sizes, int dtype_code,
   return torch::empty(sizes, options);
 }
 
+void copy_cpu_to_managed_cuda_(torch::Tensor dst, torch::Tensor src) {
+  TORCH_CHECK(dst.is_cuda(), "Destination must be a CUDA managed tensor");
+  TORCH_CHECK(src.device().is_cpu(), "Source must be a CPU tensor");
+  TORCH_CHECK(dst.is_contiguous(), "Destination must be contiguous");
+  TORCH_CHECK(src.is_contiguous(), "Source must be contiguous");
+  TORCH_CHECK(dst.scalar_type() == src.scalar_type(),
+              "Destination and source dtypes must match");
+  TORCH_CHECK(dst.numel() == src.numel(),
+              "Destination and source shapes must have the same numel");
+
+  const size_t bytes = dst.nbytes();
+  if (bytes == 0) {
+    return;
+  }
+
+  cudaPointerAttributes attrs;
+  C10_CUDA_CHECK(cudaPointerGetAttributes(&attrs, dst.data_ptr()));
+  TORCH_CHECK(attrs.type == cudaMemoryTypeManaged,
+              "Destination pointer is not cudaMallocManaged memory");
+  std::memcpy(dst.data_ptr(), src.data_ptr(), bytes);
+}
+
 void prefetch_cuda_(torch::Tensor tensor, int location_code, int device_index) {
   check_supported_tensor(tensor);
   TORCH_CHECK(device_index >= 0, "device_index must be >= 0");
@@ -134,6 +157,32 @@ void prefetch_cuda_(torch::Tensor tensor, int location_code, int device_index) {
   at::cuda::CUDAGuard device_guard(device_index);
   auto stream = at::cuda::getDefaultCUDAStream(device_index);
   C10_CUDA_CHECK(cudaMemPrefetchAsync(tensor.data_ptr(), tensor.nbytes(),
+                                      location_code, stream.stream()));
+}
+
+void prefetch_range_cuda_(torch::Tensor tensor, int64_t offset_bytes,
+                          int64_t byte_count, int location_code,
+                          int device_index) {
+  check_supported_tensor(tensor);
+  TORCH_CHECK(device_index >= 0, "device_index must be >= 0");
+  TORCH_CHECK(offset_bytes >= 0, "offset_bytes must be >= 0");
+  TORCH_CHECK(byte_count >= 0, "byte_count must be >= 0");
+  const int64_t total_bytes = static_cast<int64_t>(tensor.nbytes());
+  TORCH_CHECK(offset_bytes <= total_bytes,
+              "offset_bytes exceeds tensor byte size");
+  TORCH_CHECK(byte_count <= total_bytes - offset_bytes,
+              "prefetch byte range exceeds tensor byte size");
+  if (byte_count == 0) {
+    return;
+  }
+  if (tensor.device().is_cpu()) {
+    ensure_hmm_supported(device_index);
+  }
+  at::cuda::CUDAGuard device_guard(device_index);
+  auto stream = at::cuda::getDefaultCUDAStream(device_index);
+  auto *base = static_cast<char *>(tensor.data_ptr());
+  C10_CUDA_CHECK(cudaMemPrefetchAsync(base + offset_bytes,
+                                      static_cast<size_t>(byte_count),
                                       location_code, stream.stream()));
 }
 
